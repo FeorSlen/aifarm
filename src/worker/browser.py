@@ -21,14 +21,14 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from urllib.parse import quote_plus, unquote, urlsplit
+from urllib.parse import unquote, urlsplit
 
 from camoufox.sync_api import Camoufox
 
 GOOGLE_URL = "https://www.google.com"
 SEARCH_BOX = "textarea[name='q']"
 ACCEPT_COOKIES_BTN = "#L2AGLb"  # id кнопки "Accept all" у Google, не зависит от локали
-AI_MODE_PARAM = "udm=50"  # AI Mode; добавляем в URL вместо клика по вкладке "Режим ИИ"
+AI_MODE_LINK = 'a[href*="udm=50"]'  # вкладка "Режим ИИ" на странице выдачи; udm=50 от локали не зависит
 FOLLOWUP_INPUT = 'textarea.ITIRGe, textarea[placeholder="Задайте вопрос"]'
 AI_ANSWER = '[data-container-id="main-col"]'  # один такой блок на ход диалога AI Mode
 
@@ -306,7 +306,7 @@ class Browser:
         return context.new_page()
 
     def _open_ai_mode(self, page, prompt: str, human_tail: str = None):
-        """google.com → ввод prompt → AI Mode по udm=50 → ждём контейнер ответа.
+        """google.com → ввод запроса → клик по вкладке "Режим ИИ" → ждём ответ.
 
         human_tail: если задан — prompt вставляется целиком (fill), а human_tail
         допечатывается по-человечески в конце (для длинного контекста + короткого
@@ -318,30 +318,24 @@ class Browser:
         box = page.locator(SEARCH_BOX)
         if human_tail is None:
             self._human_type(page, box, prompt)
-            typed = prompt
         else:
             box.click()
             box.fill(prompt)
             page.wait_for_timeout(random.uniform(200, 500))
             page.keyboard.press("End")
             self._human_type(page, box, human_tail, focus=False)
-            typed = prompt + human_tail
         page.wait_for_timeout(random.uniform(400, 1100))  # перечитать перед Enter
         box.press("Enter")
-        page.wait_for_load_state("load", timeout=NAV_TIMEOUT)  # нужен settled page.url
+        page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
         _check_blocked(page)
 
-        # В AI Mode — добавлением udm=50 к URL выдачи (ровно то, что делает клик по
-        # вкладке "Режим ИИ"), без поиска и клика по самой ссылке.
-        url = page.url.split("#")[0]
-        if AI_MODE_PARAM in url:
-            pass  # Enter уже привёл в AI Mode
-        elif "/search" in url:
-            page.goto(url + ("&" if "?" in url else "?") + AI_MODE_PARAM,
-                      wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-        else:  # Enter не долетел до /search — строим URL AI Mode из запроса
-            page.goto(f"{GOOGLE_URL}/search?q={quote_plus(typed[:1500])}&{AI_MODE_PARAM}",
-                      wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        # Переход в AI Mode кликом по вкладке "Режим ИИ" (a[href*="udm=50"]) —
+        # как это делает человек; SPA-переход, без конструирования URL.
+        link = page.locator(AI_MODE_LINK).first
+        link.wait_for(state="visible", timeout=EL_TIMEOUT)
+        page.wait_for_timeout(random.uniform(300, 900))
+        link.click()
+        page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
         _check_blocked(page)
         page.locator(AI_ANSWER).last.wait_for(state="visible", timeout=EL_TIMEOUT)
 
