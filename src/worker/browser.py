@@ -122,7 +122,11 @@ class SearchSession:
     page: object
     user_session_id: str
     created_at: datetime
-    answer_offset: int = 0  # длина текста main-col до последнего вопроса (для follow-up)
+    transcript: list = None  # [(вопрос, ответ), ...] — для контекста follow-up
+
+    def __post_init__(self):
+        if self.transcript is None:
+            self.transcript = []
 
 
 def _check_blocked(page):
@@ -282,9 +286,10 @@ class Browser:
                 return  # кнопку не нашли — дальше по коду упрёмся и залогируем
             page.wait_for_timeout(1500)
 
-    def _human_type(self, page, locator, text):
-        locator.click()
-        page.wait_for_timeout(random.uniform(150, 400))  # прицелиться перед вводом
+    def _human_type(self, page, locator, text, focus=True):
+        if focus:
+            locator.click()
+            page.wait_for_timeout(random.uniform(150, 400))  # прицелиться перед вводом
         for ch in text:
             page.keyboard.type(ch)
             delay = random.uniform(70, 160)
@@ -300,84 +305,96 @@ class Browser:
                 return p
         return context.new_page()
 
+    def _open_ai_mode(self, page, prompt: str, human_tail: str = None):
+        """google.com → ввод prompt → AI Mode по udm=50 → ждём контейнер ответа.
+
+        human_tail: если задан — prompt вставляется целиком (fill), а human_tail
+        допечатывается по-человечески в конце (для длинного контекста + короткого
+        живого вопроса).
+        """
+        page.goto(GOOGLE_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        self._accept_cookies(page)
+
+        box = page.locator(SEARCH_BOX)
+        if human_tail is None:
+            self._human_type(page, box, prompt)
+            typed = prompt
+        else:
+            box.click()
+            box.fill(prompt)
+            page.wait_for_timeout(random.uniform(200, 500))
+            page.keyboard.press("End")
+            self._human_type(page, box, human_tail, focus=False)
+            typed = prompt + human_tail
+        page.wait_for_timeout(random.uniform(400, 1100))  # перечитать перед Enter
+        box.press("Enter")
+        page.wait_for_load_state("load", timeout=NAV_TIMEOUT)  # нужен settled page.url
+        _check_blocked(page)
+
+        # В AI Mode — добавлением udm=50 к URL выдачи (ровно то, что делает клик по
+        # вкладке "Режим ИИ"), без поиска и клика по самой ссылке.
+        url = page.url.split("#")[0]
+        if AI_MODE_PARAM in url:
+            pass  # Enter уже привёл в AI Mode
+        elif "/search" in url:
+            page.goto(url + ("&" if "?" in url else "?") + AI_MODE_PARAM,
+                      wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        else:  # Enter не долетел до /search — строим URL AI Mode из запроса
+            page.goto(f"{GOOGLE_URL}/search?q={quote_plus(typed[:1500])}&{AI_MODE_PARAM}",
+                      wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        _check_blocked(page)
+        page.locator(AI_ANSWER).last.wait_for(state="visible", timeout=EL_TIMEOUT)
+
     def new_search_session(self, user_session_id: str, query: str) -> str:
         """Открывает вкладку, ищет query, переходит в AI Mode. Возвращает session_id."""
         self._expire_sessions()
         context = self._ensure_browser()
         page = self._take_free_page(context)
         page.bring_to_front()
-
         try:
-            page.goto(GOOGLE_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-            self._accept_cookies(page)
-
-            search_box = page.locator(SEARCH_BOX)
-            self._human_type(page, search_box, query)
-            page.wait_for_timeout(random.uniform(400, 1100))  # перечитать перед Enter
-            search_box.press("Enter")
-            page.wait_for_load_state("load", timeout=NAV_TIMEOUT)  # нужен settled page.url
-            _check_blocked(page)
-
-            # В AI Mode — добавлением udm=50 к URL выдачи (ровно то, что делает
-            # клик по вкладке "Режим ИИ"), без поиска и клика по самой ссылке.
-            url = page.url.split("#")[0]
-            if AI_MODE_PARAM in url:
-                pass  # Enter уже привёл в AI Mode
-            elif "/search" in url:
-                page.goto(url + ("&" if "?" in url else "?") + AI_MODE_PARAM,
-                          wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-            else:  # Enter не долетел до /search — строим URL AI Mode из запроса
-                page.goto(f"{GOOGLE_URL}/search?q={quote_plus(query)}&{AI_MODE_PARAM}",
-                          wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-            _check_blocked(page)
-            page.locator(AI_ANSWER).last.wait_for(state="visible", timeout=EL_TIMEOUT)
+            self._open_ai_mode(page, query)
         except Exception:
             self._dump_page(page, "fail")
             _check_blocked(page)  # /sorry/ мог прилететь редиректом уже после проверки
             raise
 
         session_id = uuid.uuid4().hex[:8]
-        self._sessions[session_id] = SearchSession(page, user_session_id, datetime.now(UTC))
+        session = SearchSession(page, user_session_id, datetime.now(UTC))
+        session.transcript.append([query, None])  # ответ допишет get_last_ai_answer
+        self._sessions[session_id] = session
         return self._public_session_id(session_id)
 
     def ask_followup(self, user_session_id: str, session_id: str, query: str) -> None:
-        """Задаёт новый вопрос в том же диалоге AI Mode, той же вкладкой."""
+        """AI Mode не продолжает диалог без логина (а логин из VPS не встаёт).
+
+        Поэтому follow-up = НОВЫЙ поиск AI Mode той же вкладкой, с подшитым
+        контекстом предыдущих ходов. Контекст вставляется fill'ом, сам вопрос —
+        по-человечески.
+        """
         session = self._session(user_session_id, session_id)
         page = session.page
-        page.bring_to_front()  # фоновая вкладка не рисует кадры, actionability-чеки виснут
+        page.bring_to_front()
 
-        # main-col — единый контейнер, накапливает все ходы диалога; новый ход =
-        # прирост его текста. Счётчик самих main-col не растёт — он всегда один.
-        before_len = len(page.locator(AI_ANSWER).first.inner_text())
-        session.answer_offset = before_len
-        box = page.locator(FOLLOWUP_INPUT).first
-        box.wait_for(state="visible", timeout=EL_TIMEOUT)
-        self._human_type(page, box, query)
-        page.wait_for_timeout(random.uniform(400, 1100))
-        box.press("Enter")
+        ctx = "Продолжается обсуждение. Ранее:\n"
+        for q, a in session.transcript[-3:]:
+            ctx += f"— вопрос: {q}\n"
+            if a:
+                ctx += f"  ответ: {a[:700]}\n"
+        ctx = ctx[:6000] + "\n\nС учётом этого ответь на новый вопрос: "
 
         try:
-            # Бюджет как у самого стриминга (STREAM_TIMEOUT), не как у ожидания
-            # элемента (EL_TIMEOUT) — это ожидание начала генерации ответа, не клика.
-            page.wait_for_function(
-                f"n => {{ const el = document.querySelector('{AI_ANSWER}');"
-                f" return el && el.innerText.length > n + 40; }}",
-                arg=before_len,
-                timeout=STREAM_TIMEOUT * 1000,
-            )
+            self._open_ai_mode(page, ctx, human_tail=query)
         except Exception:
-            # follow-up идёт через AJAX, а не полную навигацию — URL может
-            # не смениться на /sorry/ даже при блокировке, так что это не
-            # железобетонная проверка, но лучше, чем голый TimeoutError
             self._dump_page(page, "followup-fail")
             _check_blocked(page)
             raise
+        session.transcript.append([query, None])
 
     def get_last_ai_answer(self, user_session_id: str, session_id: str) -> str:
-        """Текст последнего ответа в диалоге AI Mode этой сессии.
+        """Текст ответа AI Mode на последний вопрос этой сессии.
 
-        main-col накапливает все ходы; для follow-up (answer_offset > 0) отдаём
-        только прирост — новый ход, а не всю ветку.
+        Каждый вопрос (первый и follow-up) — свежий поиск AI Mode с одним ответом
+        в main-col, поэтому берём его целиком.
         """
         session = self._session(user_session_id, session_id)
         page = session.page
@@ -397,10 +414,11 @@ class Browser:
                 stable_since = now
             elif current and now - stable_since >= 1.5:
                 if os.getenv("AIFARM_DUMP_ANSWER"):
-                    self._dump_page(page, "ok")  # вся страница — для отладки селекторов
-                if session.answer_offset and len(current) > session.answer_offset:
-                    return _clean_text(current[session.answer_offset:])
-                return self._denoise(answer, current)
+                    self._dump_page(page, "ok")
+                text = self._denoise(answer, current)
+                if session.transcript and session.transcript[-1][1] is None:
+                    session.transcript[-1][1] = text  # для контекста будущих follow-up
+                return text
             page.wait_for_timeout(250)
         raise TimeoutError("AI answer did not finish streaming")
 
