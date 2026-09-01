@@ -1,5 +1,5 @@
 aio-pika>=9.5,<10
-camoufox>=0.4,<1
+camoufox>=0.5.5,<0.6
 fastapi>=0.115,<1
 mcp>=2.1,<2.2
 pika>=1.3,<2

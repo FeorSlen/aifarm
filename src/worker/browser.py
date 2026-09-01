@@ -21,14 +21,14 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote_plus, unquote, urlsplit
 
 from camoufox.sync_api import Camoufox
 
 GOOGLE_URL = "https://www.google.com"
 SEARCH_BOX = "textarea[name='q']"
 ACCEPT_COOKIES_BTN = "#L2AGLb"  # id кнопки "Accept all" у Google, не зависит от локали
-AI_MODE_LINK = 'a[href*="udm=50"]'  # udm=50 = AI Mode, тоже не зависит от локали
+AI_MODE_PARAM = "udm=50"  # AI Mode; добавляем в URL вместо клика по вкладке "Режим ИИ"
 FOLLOWUP_INPUT = 'textarea.ITIRGe, textarea[placeholder="Задайте вопрос"]'
 AI_ANSWER = '[data-container-id="main-col"]'  # один такой блок на ход диалога AI Mode
 
@@ -95,7 +95,10 @@ def _clean_text(text: str) -> str:
     return "\n".join(out).strip()
 
 # Настройки, общие для любой личности (сам fingerprint-профиль/прокси —
-# за экземпляром Browser, см. Browser._launch_config).
+# за экземпляром Browser, см. Browser._launch_config). fonts/screen/window=None —
+# Camoufox сам берёт значения из реального распределения устройств, не трогаем.
+# firefox_user_prefs пустой: любые не-дефолтные prefs — лишняя поверхность
+# фингерпринта, а переход в AI Mode теперь по URL, а не кликом по ссылке.
 _BASE_CONFIG = dict(
     geoip=FLAG_GEOIP,
     headless=os.getenv("GOOGLE_HEADLESS", "false").lower() == "true",
@@ -107,10 +110,6 @@ _BASE_CONFIG = dict(
     window=None,
     args=[],
     i_know_what_im_doing=False,
-    firefox_user_prefs={
-        "browser.link.open_newwindow": 3,
-        "browser.link.open_newwindow.restriction": 0,
-    },
 )
 
 
@@ -123,6 +122,7 @@ class SearchSession:
     page: object
     user_session_id: str
     created_at: datetime
+    answer_offset: int = 0  # длина текста main-col до последнего вопроса (для follow-up)
 
 
 def _check_blocked(page):
@@ -284,9 +284,13 @@ class Browser:
 
     def _human_type(self, page, locator, text):
         locator.click()
+        page.wait_for_timeout(random.uniform(150, 400))  # прицелиться перед вводом
         for ch in text:
             page.keyboard.type(ch)
-            page.wait_for_timeout(random.uniform(60, 180))
+            delay = random.uniform(70, 160)
+            if ch == " " or random.random() < 0.06:  # пауза на пробеле / изредка «задумался»
+                delay += random.uniform(120, 350)
+            page.wait_for_timeout(delay)
 
     def _take_free_page(self, context):
         # Camoufox стартует с одной пустой about:blank вкладкой. Если её
@@ -309,15 +313,23 @@ class Browser:
 
             search_box = page.locator(SEARCH_BOX)
             self._human_type(page, search_box, query)
-            page.wait_for_timeout(random.uniform(200, 500))
+            page.wait_for_timeout(random.uniform(400, 1100))  # перечитать перед Enter
             search_box.press("Enter")
-            page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
+            page.wait_for_load_state("load", timeout=NAV_TIMEOUT)  # нужен settled page.url
             _check_blocked(page)
 
-            ai_mode_link = page.locator(AI_MODE_LINK).first
-            ai_mode_link.wait_for(state="visible", timeout=EL_TIMEOUT)
-            ai_mode_link.click()
-            page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
+            # В AI Mode — добавлением udm=50 к URL выдачи (ровно то, что делает
+            # клик по вкладке "Режим ИИ"), без поиска и клика по самой ссылке.
+            url = page.url.split("#")[0]
+            if AI_MODE_PARAM in url:
+                pass  # Enter уже привёл в AI Mode
+            elif "/search" in url:
+                page.goto(url + ("&" if "?" in url else "?") + AI_MODE_PARAM,
+                          wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            else:  # Enter не долетел до /search — строим URL AI Mode из запроса
+                page.goto(f"{GOOGLE_URL}/search?q={quote_plus(query)}&{AI_MODE_PARAM}",
+                          wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            _check_blocked(page)
             page.locator(AI_ANSWER).last.wait_for(state="visible", timeout=EL_TIMEOUT)
         except Exception:
             self._dump_page(page, "fail")
@@ -330,32 +342,45 @@ class Browser:
 
     def ask_followup(self, user_session_id: str, session_id: str, query: str) -> None:
         """Задаёт новый вопрос в том же диалоге AI Mode, той же вкладкой."""
-        page = self._session(user_session_id, session_id).page
+        session = self._session(user_session_id, session_id)
+        page = session.page
         page.bring_to_front()  # фоновая вкладка не рисует кадры, actionability-чеки виснут
 
-        prev_count = page.locator(AI_ANSWER).count()
+        # main-col — единый контейнер, накапливает все ходы диалога; новый ход =
+        # прирост его текста. Счётчик самих main-col не растёт — он всегда один.
+        before_len = len(page.locator(AI_ANSWER).first.inner_text())
+        session.answer_offset = before_len
         box = page.locator(FOLLOWUP_INPUT).first
         box.wait_for(state="visible", timeout=EL_TIMEOUT)
         self._human_type(page, box, query)
-        page.wait_for_timeout(random.uniform(200, 500))
+        page.wait_for_timeout(random.uniform(400, 1100))
         box.press("Enter")
 
         try:
+            # Бюджет как у самого стриминга (STREAM_TIMEOUT), не как у ожидания
+            # элемента (EL_TIMEOUT) — это ожидание начала генерации ответа, не клика.
             page.wait_for_function(
-                f"expected => document.querySelectorAll('{AI_ANSWER}').length > expected",
-                arg=prev_count,
-                timeout=EL_TIMEOUT,
+                f"n => {{ const el = document.querySelector('{AI_ANSWER}');"
+                f" return el && el.innerText.length > n + 40; }}",
+                arg=before_len,
+                timeout=STREAM_TIMEOUT * 1000,
             )
         except Exception:
             # follow-up идёт через AJAX, а не полную навигацию — URL может
             # не смениться на /sorry/ даже при блокировке, так что это не
             # железобетонная проверка, но лучше, чем голый TimeoutError
+            self._dump_page(page, "followup-fail")
             _check_blocked(page)
             raise
 
     def get_last_ai_answer(self, user_session_id: str, session_id: str) -> str:
-        """Текст последнего ответа в диалоге AI Mode этой сессии."""
-        page = self._session(user_session_id, session_id).page
+        """Текст последнего ответа в диалоге AI Mode этой сессии.
+
+        main-col накапливает все ходы; для follow-up (answer_offset > 0) отдаём
+        только прирост — новый ход, а не всю ветку.
+        """
+        session = self._session(user_session_id, session_id)
+        page = session.page
         answer = page.locator(AI_ANSWER).last
         answer.wait_for(state="visible", timeout=EL_TIMEOUT)
 
@@ -371,6 +396,10 @@ class Browser:
                 previous = current
                 stable_since = now
             elif current and now - stable_since >= 1.5:
+                if os.getenv("AIFARM_DUMP_ANSWER"):
+                    self._dump_page(page, "ok")  # вся страница — для отладки селекторов
+                if session.answer_offset and len(current) > session.answer_offset:
+                    return _clean_text(current[session.answer_offset:])
                 return self._denoise(answer, current)
             page.wait_for_timeout(250)
         raise TimeoutError("AI answer did not finish streaming")
