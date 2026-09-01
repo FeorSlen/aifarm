@@ -1,0 +1,67 @@
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-aifarm}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?copy .env.example to .env and set RABBITMQ_PASSWORD}
+    ports:
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  gateway:
+    build: .
+    restart: unless-stopped
+    command: uvicorn src.api.gateway:app --host 0.0.0.0 --port 8000
+    environment: &app-environment
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-aifarm}:${RABBITMQ_PASSWORD:?copy .env.example to .env and set RABBITMQ_PASSWORD}@rabbitmq:5672/%2F
+      WORKER_ID: ${WORKER_ID:-worker1}
+      AIFARM_USER_ID: ${AIFARM_USER_ID:-}
+      AIFARM_MCP_HOST: ${AIFARM_MCP_HOST:-127.0.0.1}
+      AIFARM_SEARCH_TIMEOUT_S: ${AIFARM_SEARCH_TIMEOUT_S:-180}
+    ports:
+      # публичный доступ на VPS: GATEWAY_BIND=0.0.0.0:8000 (+ AIFARM_MCP_HOST=0.0.0.0)
+      - "${GATEWAY_BIND:-127.0.0.1:8000}:8000"
+    volumes:
+      - .:/app
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  worker:
+    build: .
+    restart: unless-stopped
+    command: /bin/sh -c 'rm -f /tmp/.X99-lock /tmp/.X11-unix/X99; Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp & export DISPLAY=:99; exec python -m src.worker.worker'
+    environment:
+      <<: *app-environment
+      GOOGLE_HEADLESS: ${GOOGLE_HEADLESS:-false}
+      PROFILES_DIR: /data/profiles
+      PROXY_URL: ${PROXY_URL:-}                        # http://user:pass@host:port; пусто = прямое
+      GOOGLE_COOKIES_FILE: ${GOOGLE_COOKIES_FILE:-}    # /app/cookies.txt (Netscape/JSON)
+      AIFARM_DUMP_ANSWER: ${AIFARM_DUMP_ANSWER:-}      # каталог дампа ответа/сбоя, напр. /data/profiles/dump
+      AIFARM_SEED_COOKIES: ${AIFARM_SEED_COOKIES:-true}
+      AIFARM_ACCEPT_CONSENT: ${AIFARM_ACCEPT_CONSENT:-true}
+      AIFARM_BURN_ON_BLOCK: ${AIFARM_BURN_ON_BLOCK:-true}
+      AIFARM_HUMANIZE: ${AIFARM_HUMANIZE:-true}
+      AIFARM_GEOIP: ${AIFARM_GEOIP:-true}
+      AIFARM_BLOCK_WEBRTC: ${AIFARM_BLOCK_WEBRTC:-true}
+      AIFARM_DENOISE: ${AIFARM_DENOISE:-true}
+      NAV_TIMEOUT_MS: ${NAV_TIMEOUT_MS:-45000}
+      EL_TIMEOUT_MS: ${EL_TIMEOUT_MS:-20000}
+      STREAM_TIMEOUT_S: ${STREAM_TIMEOUT_S:-45}
+    volumes:
+      - .:/app
+      - browser-profiles:/data/profiles
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  rabbitmq-data:
+  browser-profiles:

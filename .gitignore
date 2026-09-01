@@ -1,0 +1,11 @@
+.git
+__pycache__/
+*.py[cod]
+.venv/
+.env
+profiles/
+answer_dump/
+dump/
+cookies.txt
+cookies.json
+.idea/
