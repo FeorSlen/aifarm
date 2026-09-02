@@ -53,10 +53,13 @@ GOOGLE_COOKIES_FILE=/app/cookies.txt     # . смонтирован в /app
 | Переменная | Дефолт | Что делает |
 |---|---|---|
 | `PROXY_URL` | — | sticky-прокси; пусто = прямое подключение |
+| `AIFARM_PROFILE_ROOT` | — | пул постоянных профилей `user1…userN`; профили с `.needs_attention` пропускаются |
+| `AIFARM_PROFILE_COUNT` | `10` | число профилей в пуле |
+| `AIFARM_PROFILE_PATH` | — | прямой путь к одному профилю; имеет приоритет над пулом |
 | `GOOGLE_COOKIES_FILE` | — | путь к файлу куков (Netscape/JSON) |
 | `AIFARM_SEED_COOKIES` | `true` | инъекция куков (файл + дефолтное согласие) до навигации |
 | `AIFARM_ACCEPT_CONSENT` | `true` | авто-принятие диалога согласия Google (все фреймы/локали) |
-| `AIFARM_BURN_ON_BLOCK` | `true` | при `/sorry/` сносить профиль+сессию и брать новую личность; `false` — оставить как есть (прогрев/отладка) |
+| `AIFARM_BURN_ON_BLOCK` | `true` | вне пула при `/sorry/` закрыть контекст и выбрать новый профиль, сохранив старый; `false` — не переключать |
 | `AIFARM_HUMANIZE` | `true` | человекоподобные движения курсора Camoufox |
 | `AIFARM_GEOIP` | `true` | подгонка TZ/локали браузера под exit-IP прокси |
 | `AIFARM_BLOCK_WEBRTC` | `true` | блок утечки реального IP через WebRTC |
@@ -71,6 +74,21 @@ GOOGLE_COOKIES_FILE=/app/cookies.txt     # . смонтирован в /app
 | `AIFARM_MCP_HOST` | `127.0.0.1` | host для `/mcp`; не-loopback выключает DNS-rebinding guard |
 | `AIFARM_USER_ID` | — | общий namespace-арендатор (uuid4) для клиентов без `X-Aifarm-User` |
 | `WORKER_ID` | `worker1` | id воркера (маршрутизация в RabbitMQ) |
+
+## Ручной прогрев профилей
+
+Профили хранятся локально в `protected profile/profile/user1…user10`; каталог
+игнорируется Git. Открыть профиль для ручной проверки:
+
+```bash
+python scripts/warm_profile.py 1
+```
+
+При `/sorry/` worker сохраняет текущий профиль, создаёт в нём маркер
+`.needs_attention` и выбирает следующий готовый профиль. Заблокированный запрос
+не повторяется автоматически. Когда готовых профилей нет, MCP возвращает
+`human_action_required`. После ручной проверки скрипт предложит удалить маркер
+и вернуть профиль в пул.
 
 ## Известные ограничения
 

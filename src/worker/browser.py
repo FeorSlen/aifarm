@@ -16,11 +16,12 @@
 import json
 import os
 import random
-import shutil
+import re
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from camoufox.sync_api import Camoufox
@@ -110,11 +111,19 @@ _BASE_CONFIG = dict(
     window=None,
     args=[],
     i_know_what_im_doing=False,
+    firefox_user_prefs={
+        "browser.link.open_newwindow": 3,
+        "browser.link.open_newwindow.restriction": 0,
+    },
 )
 
 
 class BlockedError(Exception):
     """Google принял браузер за бота (редирект на /sorry/, капча)."""
+
+
+class ProfilePoolExhaustedError(Exception):
+    """Все сохранённые профили требуют ручной проверки."""
 
 
 @dataclass
@@ -206,18 +215,58 @@ class Browser:
         self._cm = None       # Camoufox context-manager, для ручного закрытия в shutdown()
         self._context = None  # запущенный BrowserContext
         self._sessions: dict[str, SearchSession] = {}
+        root = os.getenv("AIFARM_PROFILE_ROOT", "").strip()
+        direct_path = os.getenv("AIFARM_PROFILE_PATH", "").strip()
+        count = int(os.getenv("AIFARM_PROFILE_COUNT", "10"))
+        if count < 1:
+            raise ValueError("AIFARM_PROFILE_COUNT must be positive")
+        self._profile_pool = (
+            [Path(root) / f"user{number}" for number in range(1, count + 1)]
+            if root and not direct_path
+            else []
+        )
+        self._profile_cursor = -1
         self._new_identity()
 
     def _new_identity(self):
         """Генерирует новый профиль/прокси. Сам браузер (пере)запустится лениво."""
-        identity = uuid.uuid4().hex[:8]
-        self._profile_dir = f"{PROFILES_DIR}/{self._worker_id}_{identity}"
+        profile_path = os.getenv("AIFARM_PROFILE_PATH", "").strip()
+        requested = os.getenv("AIFARM_PROFILE_ID", "").strip()
+        if profile_path:
+            self._profile_dir = profile_path
+        elif self._profile_pool:
+            self._select_next_profile()
+        else:
+            identity = (
+                re.sub(r"[^A-Za-z0-9_-]", "_", requested)[:64]
+                if requested
+                else uuid.uuid4().hex[:8]
+            )
+            self._profile_dir = f"{PROFILES_DIR}/{self._worker_id}_{identity}"
         self._proxy = _next_proxy()
+
+    @property
+    def profile_id(self) -> str | None:
+        return Path(self._profile_dir).name if self._profile_dir else None
+
+    def _select_next_profile(self) -> str | None:
+        for offset in range(1, len(self._profile_pool) + 1):
+            index = (self._profile_cursor + offset) % len(self._profile_pool)
+            profile = self._profile_pool[index]
+            if not (profile / ".needs_attention").exists():
+                profile.mkdir(parents=True, exist_ok=True)
+                self._profile_cursor = index
+                self._profile_dir = str(profile)
+                return profile.name
+        self._profile_dir = None
+        return None
 
     def _launch_config(self):
         return {**_BASE_CONFIG, "user_data_dir": self._profile_dir, "proxy": self._proxy}
 
     def _ensure_browser(self):
+        if self._profile_dir is None:
+            raise ProfilePoolExhaustedError("нет готовых профилей")
         if self._context is None:
             self._cm = Camoufox(**self._launch_config())
             self._context = self._cm.start()
@@ -359,29 +408,29 @@ class Browser:
         return self._public_session_id(session_id)
 
     def ask_followup(self, user_session_id: str, session_id: str, query: str) -> None:
-        """AI Mode не продолжает диалог без логина (а логин из VPS не встаёт).
-
-        Поэтому follow-up = НОВЫЙ поиск AI Mode той же вкладкой, с подшитым
-        контекстом предыдущих ходов. Контекст вставляется fill'ом, сам вопрос —
-        по-человечески.
-        """
+        """Задаёт новый вопрос в том же диалоге AI Mode, той же вкладкой."""
         session = self._session(user_session_id, session_id)
         page = session.page
         page.bring_to_front()
 
-        ctx = "Продолжается обсуждение. Ранее:\n"
-        for q, a in session.transcript[-3:]:
-            ctx += f"— вопрос: {q}\n"
-            if a:
-                ctx += f"  ответ: {a[:700]}\n"
-        ctx = ctx[:6000] + "\n\nС учётом этого ответь на новый вопрос: "
+        previous_answers = page.locator(AI_ANSWER).count()
+        box = page.locator(FOLLOWUP_INPUT).first
+        box.wait_for(state="visible", timeout=EL_TIMEOUT)
+        self._human_type(page, box, query)
+        page.wait_for_timeout(random.uniform(200, 500))
+        box.press("Enter")
 
         try:
-            self._open_ai_mode(page, ctx, human_tail=query)
+            page.wait_for_function(
+                f"expected => document.querySelectorAll('{AI_ANSWER}').length > expected",
+                arg=previous_answers,
+                timeout=EL_TIMEOUT,
+            )
         except Exception:
-            self._dump_page(page, "followup-fail")
             _check_blocked(page)
             raise
+
+        # get_last_ai_answer() fills the answer after the worker receives it.
         session.transcript.append([query, None])
 
     def get_last_ai_answer(self, user_session_id: str, session_id: str) -> str:
@@ -518,17 +567,16 @@ class Browser:
         self._sessions.clear()
 
     def burn_and_rotate(self):
-        """
-        Личность спалена: закрыть браузер, снести профиль с диска, взять
-        новый профиль/прокси. Все текущие session_id умирают вместе со
-        старыми cookies — это ожидаемо, они были частью сожжённой личности.
-
-        AIFARM_BURN_ON_BLOCK=false — не делаем ничего: профиль/сессии/куки
-        остаются как есть (для отладки и прогрева на живых куках).
-        """
+        """Сохраняет проблемный профиль и выбирает следующий, не повторяя запрос."""
+        if self._profile_pool:
+            blocked_profile = self.profile_id
+            marker = Path(self._profile_dir) / ".needs_attention"
+            marker.write_text(datetime.now(UTC).isoformat(), encoding="utf-8")
+            self.shutdown()
+            return blocked_profile, self._select_next_profile()
         if not FLAG_BURN_ON_BLOCK:
-            return
+            return self.profile_id, None
         old_profile_dir = self._profile_dir
         self.shutdown()
-        shutil.rmtree(old_profile_dir, ignore_errors=True)
         self._new_identity()
+        return Path(old_profile_dir).name, self.profile_id

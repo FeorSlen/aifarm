@@ -16,6 +16,8 @@ class Result(BaseModel):
     answer: str | None = None
     error: str | None = None
     sessions: list[str] | None = None
+    profile_id: str | None = None
+    next_profile_id: str | None = None
 
 
 def worker_id(session_id: str) -> str:

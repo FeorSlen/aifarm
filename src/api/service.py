@@ -8,7 +8,6 @@ import aio_pika
 from src.config import RABBITMQ_URL, TASK_EXCHANGE, WORKER_ID
 from src.contract import Result, Task, worker_id
 
-BLOCKED_RETRY_SECONDS = 900
 CONTROL_TIMEOUT_SECONDS = 10
 
 log = logging.getLogger(__name__)
@@ -44,6 +43,8 @@ class Job:
     answer: str | None = None
     error: dict | None = None
     closed_tab_ids: list[str] = field(default_factory=list)
+    profile_id: str | None = None
+    next_profile_id: str | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)  # ставится на любом терминальном статусе
 
 
@@ -131,8 +132,11 @@ class Gateway:
                 "status": "blocked",
                 "tab_id": job.tab_id,
                 "closed_tab_ids": job.closed_tab_ids,
-                "retry_after_seconds": BLOCKED_RETRY_SECONDS,
+                "profile_id": job.profile_id,
+                "next_profile_id": job.next_profile_id,
             }
+        if job.status == "human_action_required":
+            return {"status": "human_action_required", "profile_id": job.profile_id}
         return {"status": "failed", "tab_id": job.tab_id, "error": job.error}
 
     async def close_tab(self, user_session_id: str, tab_id: str):
@@ -162,9 +166,14 @@ class Gateway:
         if job is None or job.status != "pending":
             return
         if result.error:
-            if result.error.startswith("blocked:"):
+            if result.error == "profile_blocked":
                 job.status = "blocked"
                 job.closed_tab_ids = result.sessions or []
+                job.profile_id = result.profile_id
+                job.next_profile_id = result.next_profile_id
+            elif result.error == "human_action_required":
+                job.status = "human_action_required"
+                job.profile_id = result.profile_id
             elif result.error == "session_not_found":
                 job.status = "failed"
                 job.error = {"code": "tab_not_found", "message": "Вкладка не найдена"}

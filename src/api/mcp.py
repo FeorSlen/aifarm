@@ -166,10 +166,16 @@ async def search(
         )
     if status == "blocked":
         closed = ", ".join(result["closed_tab_ids"]) or "—"
-        retry_min = round(result["retry_after_seconds"] / 60)
         raise ToolError(
-            "Google заблокировал воркер; личность браузера сменена, закрыты "
-            f"вкладки: {closed}. Повторите примерно через {retry_min} мин."
+            f"Google запросил проверку профиля {result['profile_id']}; профиль и cookies "
+            f"сохранены и помечены для ручного прогрева. Следующий запрос пойдёт через "
+            f"{result['next_profile_id']}. Текущий запрос не повторён; закрыты вкладки: {closed}."
+        )
+    if status == "human_action_required":
+        profile = result.get("profile_id") or "последний доступный профиль"
+        raise ToolError(
+            f"Google запросил проверку {profile}, и готовых профилей больше нет. "
+            "Требуется ручной прогрев; после него профиль нужно вернуть в пул."
         )
     code = (result.get("error") or {}).get("code")
     if code == "tab_not_found":

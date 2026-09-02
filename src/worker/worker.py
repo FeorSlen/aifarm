@@ -3,7 +3,7 @@ import time
 
 import pika
 
-from .browser import BlockedError, Browser
+from .browser import BlockedError, Browser, ProfilePoolExhaustedError
 from src.config import RABBITMQ_URL, TASK_EXCHANGE, WORKER_ID
 from src.contract import Result, Task
 
@@ -33,8 +33,17 @@ def handle(browser: Browser, task: Task) -> Result:
     except BlockedError as error:
         log.warning("blocked: %s", error)
         sessions = browser.list_sessions(task.user_session_id)
-        browser.burn_and_rotate()
-        return Result(session_id=session_id, error=f"blocked: {error}", sessions=sessions)
+        profile_id, next_profile_id = browser.burn_and_rotate()
+        code = "profile_blocked" if next_profile_id else "human_action_required"
+        return Result(
+            session_id=session_id,
+            error=code,
+            sessions=sessions,
+            profile_id=profile_id,
+            next_profile_id=next_profile_id,
+        )
+    except ProfilePoolExhaustedError:
+        return Result(error="human_action_required")
     except KeyError:
         return Result(session_id=session_id, error="session_not_found")
     except Exception as error:
