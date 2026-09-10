@@ -16,7 +16,7 @@ from typing import Annotated
 
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 from pydantic import BaseModel, Field
 
 from .service import Gateway, GatewayError
@@ -24,13 +24,30 @@ from .service import Gateway, GatewayError
 SEARCH_TIMEOUT_SECONDS = int(os.getenv("AIFARM_SEARCH_TIMEOUT_S", "180"))  # запас под медленный прокси
 PROGRESS_INTERVAL_SECONDS = 5
 
+# Первый вопрос набирается в строку поиска google.com — самый рискованный путь:
+# именно на длинных первых запросах профили уезжали на /sorry/. Живой поисковый
+# запрос — это несколько слов; замер: 64 символа проходят штатно, простыня на
+# ~1500 давала /sorry/ три раза подряд. Держим предел на уровне человеческого
+# запроса, а весь контекст уводим в поле AI Mode вторым вызовом.
+FIRST_QUERY_MAX_CHARS = int(os.getenv("AIFARM_FIRST_QUERY_MAX", "200"))
+FOLLOWUP_QUERY_MAX_CHARS = int(os.getenv("AIFARM_FOLLOWUP_QUERY_MAX", "4000"))
+
 log = logging.getLogger(__name__)
 
 INSTRUCTIONS = (
     "Инструменты этого сервера ведут реальную сессию Google AI Mode в браузере. "
-    "Вызовы медленные (10–90 с) и обрабатываются по одному — формулируйте полный "
-    "вопрос сразу, не дробите на серию поисков. tab_id из ответа search позволяет "
-    "продолжить тот же диалог с сохранением контекста."
+    "Задавайте короткие, естественные вопросы на английском языке: это даёт наиболее "
+    "стабильный переход в AI Mode и лучший поиск источников. Один вызов — один вопрос. "
+    "Вызов блокирующий и обычно занимает 1–3 минуты; дождитесь результата и не запускайте "
+    "тот же запрос повторно или параллельно. "
+    "tab_id из ответа search передавайте в следующий search, чтобы продолжить тот же "
+    "диалог с сохранением контекста. "
+    f"Первый вопрос беседы (без tab_id) — не длиннее {FIRST_QUERY_MAX_CHARS} символов: "
+    "он набирается в обычной строке поиска Google и должен быть особенно коротким. "
+    "Если задание длиннее, начните "
+    f"беседу коротким вопросом по сути, а развёрнутый текст (до {FOLLOWUP_QUERY_MAX_CHARS} "
+    "символов) пришлите вторым вызовом search с полученным tab_id — он уходит уже "
+    "в поле AI Mode."
 )
 
 mcp = MCPServer("aifarm", instructions=INSTRUCTIONS)
@@ -53,11 +70,38 @@ class SearchResult(BaseModel):
 class TabList(BaseModel):
     tabs: list[str]
 
+def _diagnostic_error(message: str, screenshot: str | None) -> CallToolResult:
+    """Ошибка MCP, к которой клиент может показать снимок браузера."""
+    content = [TextContent(type="text", text=message)]
+    if screenshot:
+        content.append(
+            ImageContent(type="image", data=screenshot, mimeType="image/png")
+        )
+    return CallToolResult(content=content, isError=True)
+
+
 
 def _gateway() -> Gateway:
     if GATEWAY is None:
         raise ToolError("Шлюз ещё не готов, повторите запрос позже")
     return GATEWAY
+
+
+def _check_question_length(question: str, tab_id: str | None) -> None:
+    """Первый вопрос короче: он идёт в строку google.com, продолжение — в AI Mode."""
+    limit = FOLLOWUP_QUERY_MAX_CHARS if tab_id else FIRST_QUERY_MAX_CHARS
+    if len(question) <= limit:
+        return
+    if tab_id:
+        raise ToolError(
+            f"Вопрос длиннее {limit} символов ({len(question)}) — сократите."
+        )
+    raise ToolError(
+        f"Первый вопрос беседы не длиннее {limit} символов (прислано {len(question)}): "
+        "он набирается в строке поиска Google. Начните беседу коротким вопросом по "
+        f"сути, а развёрнутый текст (до {FOLLOWUP_QUERY_MAX_CHARS} символов) пришлите "
+        "вторым вызовом search с полученным tab_id."
+    )
 
 
 def _user(ctx: Context) -> str:
@@ -88,8 +132,13 @@ async def search(
         str,
         Field(
             min_length=1,
-            max_length=10_000,
-            description="Вопрос на естественном языке. Не может быть пустым.",
+            max_length=FOLLOWUP_QUERY_MAX_CHARS,
+            description=(
+                "Короткий естественный вопрос на английском языке; один вызов — один "
+                "вопрос. Не может быть пустым. Без tab_id "
+                f"(первый вопрос беседы) — максимум {FIRST_QUERY_MAX_CHARS} символов, "
+                f"с tab_id — до {FOLLOWUP_QUERY_MAX_CHARS}."
+            ),
         ),
     ],
     tab_id: Annotated[
@@ -107,12 +156,17 @@ async def search(
     """Задаёт вопрос Google AI Mode через реальный браузер и возвращает ответ ИИ.
 
     Вызывайте, когда нужен свежий ответ из открытого веба, которого нет в
-    вашем знании: текущие события, цены, версии, локальная информация. Вызов
-    блокирующий, ответ приходит через 10–90 секунд. Возвращает текст ответа
-    и tab_id этой беседы.
+    вашем знании: текущие события, цены, версии, локальная информация.
+    Пишите короткий вопрос на английском языке. Вызов блокирующий, обычно занимает
+    1–3 минуты: дождитесь результата, не повторяйте запрос и не запускайте параллельный
+    search. Возвращает текст ответа и tab_id этой беседы.
+
+    Длинное задание отправляйте в два хода: короткий первый вопрос, затем
+    развёрнутый текст вторым вызовом с полученным tab_id.
     """
     if not question.strip():
         raise ToolError("Вопрос не может быть пустым")
+    _check_question_length(question, tab_id)
     gateway = _gateway()
     user = _user(ctx)
     start = time.monotonic()
@@ -168,8 +222,8 @@ async def search(
         closed = ", ".join(result["closed_tab_ids"]) or "—"
         raise ToolError(
             f"Google запросил проверку профиля {result['profile_id']}; профиль и cookies "
-            f"сохранены и помечены для ручного прогрева. Следующий запрос пойдёт через "
-            f"{result['next_profile_id']}. Текущий запрос не повторён; закрыты вкладки: {closed}."
+            f"сохранены, он вернётся в ротацию после остывания. Следующий запрос пойдёт "
+            f"через {result['next_profile_id']}. Текущий запрос не повторён; закрыты вкладки: {closed}."
         )
     if status == "human_action_required":
         profile = result.get("profile_id") or "последний доступный профиль"
@@ -178,6 +232,25 @@ async def search(
             "Требуется ручной прогрев; после него профиль нужно вернуть в пул."
         )
     code = (result.get("error") or {}).get("code")
+    if code in ("answer_refused", "answer_unavailable"):
+        if code == "answer_refused":
+            message = (
+                "Google принял уточняющий вопрос, но ответа на него не дал "
+                "(«контент не сгенерирован»). Профиль и вкладка целы."
+            )
+        else:
+            message = (
+                "Ответ Google AI Mode не появился или не завершился. "
+                "Профиль и вкладка оставлены открытыми."
+            )
+        screenshot = result.get("screenshot")
+        diagnostic = (
+            " Состояние браузера приложено к ошибке."
+            if screenshot else " Скриншот браузера получить не удалось."
+        )
+        return _diagnostic_error(
+            message + diagnostic, screenshot,
+        )
     if code == "tab_not_found":
         raise ToolError(
             f"Вкладка {tab_id} больше не существует. Повторите search без tab_id, "

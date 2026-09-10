@@ -14,7 +14,6 @@ PROFILE_ROOT = PROJECT_ROOT / "protected profile" / "profile"
 os.environ["GOOGLE_HEADLESS"] = "false"
 os.environ["AIFARM_SEED_COOKIES"] = "false"
 os.environ["AIFARM_ACCEPT_CONSENT"] = "true"
-os.environ["AIFARM_BURN_ON_BLOCK"] = "false"
 
 sys.path.insert(0, str(PROJECT_ROOT))
 

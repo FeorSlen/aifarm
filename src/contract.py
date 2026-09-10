@@ -15,6 +15,7 @@ class Result(BaseModel):
     session_id: str | None = None
     answer: str | None = None
     error: str | None = None
+    screenshot: str | None = None  # base64 PNG только для диагностической ошибки
     sessions: list[str] | None = None
     profile_id: str | None = None
     next_profile_id: str | None = None

@@ -42,6 +42,7 @@ class Job:
     status: str = "pending"
     answer: str | None = None
     error: dict | None = None
+    screenshot: str | None = None
     closed_tab_ids: list[str] = field(default_factory=list)
     profile_id: str | None = None
     next_profile_id: str | None = None
@@ -137,7 +138,12 @@ class Gateway:
             }
         if job.status == "human_action_required":
             return {"status": "human_action_required", "profile_id": job.profile_id}
-        return {"status": "failed", "tab_id": job.tab_id, "error": job.error}
+        return {
+            "status": "failed",
+            "tab_id": job.tab_id,
+            "error": job.error,
+            "screenshot": job.screenshot,
+        }
 
     async def close_tab(self, user_session_id: str, tab_id: str):
         result = await self._call(Task(user_session_id=user_session_id, session_id=tab_id))
@@ -166,6 +172,7 @@ class Gateway:
         if job is None or job.status != "pending":
             return
         if result.error:
+            job.screenshot = result.screenshot
             if result.error == "profile_blocked":
                 job.status = "blocked"
                 job.closed_tab_ids = result.sessions or []
@@ -174,6 +181,12 @@ class Gateway:
             elif result.error == "human_action_required":
                 job.status = "human_action_required"
                 job.profile_id = result.profile_id
+            elif result.error in ("answer_refused", "answer_unavailable"):
+                job.status = "failed"
+                job.error = {
+                    "code": result.error,
+                    "message": "Google не сгенерировал ответ",
+                }
             elif result.error == "session_not_found":
                 job.status = "failed"
                 job.error = {"code": "tab_not_found", "message": "Вкладка не найдена"}

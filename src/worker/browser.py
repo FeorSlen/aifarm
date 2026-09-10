@@ -7,13 +7,22 @@
     text = br.get_last_ai_answer(user_session_id, session_id)
 
 Один Browser = один живой браузер/профиль/куки на всё время жизни текущей
-"личности". Личность — это профиль на диске + прокси; когда её спалили
-(BlockedError), br.burn_and_rotate() сносит профиль и заводит новую —
-сам объект Browser переживает это, session_id старой личности после
-ротации, естественно, недействительны.
+"личности". Личность — это каталог профиля на диске (куки + постоянное
+устройство в device.json) плюс прокси. Устройство генерируется при первом
+запуске профиля и дальше только читается: без этого Camoufox выдаёт новую
+машину на каждый запуск, и один cookie jar возвращается то с Windows, то с
+macOS.
+
+Профиль сменяется в двух случаях: его спалили (BlockedError -> burn_and_rotate,
+маркер со временем блокировки, возврат в ротацию через PROFILE_COOLDOWN) либо
+он отработал норму вопросов (PROFILE_MAX_QUERIES -> _rotate_by_load, без
+маркера). Ничего не удаляется. Сам объект Browser переживает смену, но
+session_id старой личности после неё недействительны.
 """
 
+import base64
 import json
+import math
 import os
 import random
 import re
@@ -22,25 +31,128 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from camoufox.sync_api import Camoufox
+from camoufox.utils import launch_options as camoufox_launch_options
+from playwright._impl._errors import TargetClosedError
 
-GOOGLE_URL = "https://www.google.com"
+
+def _google_url(locale: str | None) -> str:
+    """Открывает Search на том же языке, что и fingerprint браузера."""
+    if not locale:
+        return "https://www.google.com"
+    language = locale.partition("-")[0].lower()
+    if not re.fullmatch(r"[a-z]{2,3}", language):
+        raise ValueError("AIFARM_LOCALE must start with an ISO language code")
+    return f"https://www.google.com/?hl={language}"
+
+
+BROWSER_LOCALE = os.getenv("AIFARM_LOCALE", "").strip() or None
+GOOGLE_URL = _google_url(BROWSER_LOCALE)
 SEARCH_BOX = "textarea[name='q']"
 ACCEPT_COOKIES_BTN = "#L2AGLb"  # id кнопки "Accept all" у Google, не зависит от локали
 AI_MODE_LINK = 'a[href*="udm=50"]'  # вкладка "Режим ИИ" на странице выдачи; udm=50 от локали не зависит
-FOLLOWUP_INPUT = 'textarea.ITIRGe, textarea[placeholder="Задайте вопрос"]'
+# Поле уточняющего вопроса в AI Mode. На странице AI Mode ДВЕ textarea: скрытая
+# форма отзыва (class e3RQ5d, placeholder 'Jaa tietoja…' / 'Поделиться…') идёт в
+# DOM первой, настоящее поле диалога (class ITIRGe) — второй. Фильтр по
+# видимости обязателен: без него .first цепляет скрытую форму и ждёт её
+# видимости вечно (наблюдали Timeout с "43 × locator resolved").
+# Placeholder не используем — он меняется с языком интерфейса, а язык задаёт
+# exit-IP (видели французский с VPS и финский через мобильный прокси).
+FOLLOWUP_INPUT = 'textarea.ITIRGe:visible, textarea:not([name="q"]):visible'
 AI_ANSWER = '[data-container-id="main-col"]'  # один такой блок на ход диалога AI Mode
+# Блок «контент не сгенерирован», который Google рисует вместо ответа. Атрибут
+# ставит его же скрипт (`d.setAttribute("data-aeie","true")`), поэтому маркер не
+# зависит от языка — сам текст внутри локализован (видели французский на проде).
+ANSWER_ERROR = '[data-aeie="true"]'
+
+# Физические клавиши русской раскладки в английской: уточнение «Почему»
+# отправляется как «Gjxtve». Остальные символы оставляем как есть.
+_RU_TO_EN_KEYS = str.maketrans(
+    "ёйцукенгшщзхъфывапролджэячсмитьбю"
+    "ЁЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮ",
+    "`qwertyuiop[]asdfghjkl;'zxcvbnm,."
+    "~QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>",
+)
 
 PROFILES_DIR = os.getenv("PROFILES_DIR", "./profiles")
 SESSION_TTL = timedelta(hours=24)
+
+# Профиль, на котором Google показал /sorry/, не удаляется и не выбывает из пула
+# навсегда: в него кладётся маркер со временем блокировки, и через COOLDOWN он
+# сам возвращается в ротацию. Пустой/битый маркер (например, поставленный
+# руками) держит профиль вне пула до ручного снятия — scripts/warm_profile.py.
+BLOCK_MARKER = ".needs_attention"
+PROFILE_COOLDOWN = timedelta(hours=float(os.getenv("AIFARM_PROFILE_COOLDOWN_H", "6")))
+
+# Профиль отрабатывает норму вопросов и уступает место следующему, не дожидаясь
+# /sorry/: ровный поток с одного профиля — сам по себе повод для проверки.
+# Порог берётся с разбросом, чтобы смена не приходилась всегда на круглое число.
+PROFILE_MAX_QUERIES = int(os.getenv("AIFARM_PROFILE_MAX_QUERIES", "12"))  # 0 = не ротировать по нагрузке
+
+# Устройство профиля (fingerprint) генерируется один раз и лежит рядом с куками.
+# Без этого файла Camoufox выдаёт НОВОЕ устройство на каждый запуск (в
+# launch_options fingerprint=None и os=None => "infinite unique fingerprints"),
+# то есть один и тот же cookie jar возвращается то с Windows, то с macOS — для
+# Google это противоречие внутри одной личности.
+DEVICE_FILE = "device.json"
+
+# Что в устройство НЕ сохраняем. География обязана каждый запуск выводиться из
+# текущего адреса, иначе профиль противоречит своему же IP; addons/humanize —
+# наши настройки, а не свойства машины; history.length у живой сессии и должен
+# плавать. Всё остальное из CAMOU_CONFIG — это железо, и оно постоянно.
+VOLATILE_CONFIG_KEYS = (
+    "geolocation:", "locale:", "timezone", "addons", "humanize", "window.history.length",
+)
 
 # Таймауты рассчитаны на медленный релей через прокси (residential/mobile).
 # Все — потолки, срабатывают только при зависании; на живом соединении не мешают.
 NAV_TIMEOUT = int(os.getenv("NAV_TIMEOUT_MS", "45000"))   # goto / load-state
 EL_TIMEOUT = int(os.getenv("EL_TIMEOUT_MS", "20000"))     # ожидание элементов (AI Mode, поле, ответ)
 STREAM_TIMEOUT = int(os.getenv("STREAM_TIMEOUT_S", "45"))  # стриминг ответа AI Mode
+# Появление НОВОГО блока ответа на уточняющий вопрос. Отдельно от EL_TIMEOUT:
+# тот про элементы, которые уже есть в DOM, а здесь Google сперва думает над
+# вопросом и только потом создаёт контейнер — на длинном вопросе 20 с не хватает.
+ANSWER_START_TIMEOUT = int(os.getenv("ANSWER_START_TIMEOUT_S", "60")) * 1000
+
+# Сколько последних символов запроса допечатываются посимвольно. Остальное
+# вставляется одним fill(): посимвольный ввод всей простыни — это по XHR в
+# /complete/search почти на каждую клавишу и минуты равномерного стука, то
+# есть прямая дорога на /sorry/. Человек длинный промпт вставляет, а не печатает.
+HUMAN_TAIL_CHARS = 40
+
+# Ритм печати. Равномерный интервал — главный машинный признак: у человека
+# интервалы логнормальные (медиана внутри слова ~95 мс, длинный правый хвост),
+# на границе слова и после пунктуации длиннее, изредка — настоящая пауза.
+# Итог замера: медиана ~117 мс, среднее ~142 мс/символ — около 85 слов в минуту,
+# темп быстрого, но живого человека. Быстрее гнать смысла нет: после перехода
+# на fill() вручную набирается только хвост в 40 символов, это ~5 с на запрос,
+# а ровный сверхбыстрый набор — сам по себе признак бота.
+KEY_DELAY_MEDIAN_MS = 110
+KEY_DELAY_SIGMA = 0.32      # разброс логнормали; 0 = машинно ровно
+KEY_DELAY_MIN_MS = 45       # быстрее человек не успевает даже в накате
+KEY_DELAY_MAX_MS = 400      # выше — это уже пауза, её добавляем отдельно
+THINK_PAUSE_CHANCE = 0.02   # доля нажатий, перед которыми «задумался»
+
+# Чтение ответа прокруткой. Ответ AI Mode длиннее экрана, и сессия, которая
+# сгенерировала простыню и не сдвинула её ни на пиксель, ведёт себя не как
+# читатель. Один жест = дистанция SCROLL_STEP_PX, но отправляется он НЕ одним
+# wheel-событием: живой тачпад шлёт десятки мелких щелчков с разгоном в начале
+# и торможением в конце. Одиночный прыжок на 300 px — это подпись автомата.
+# Чтение ответа перед уточняющим вопросом. Раньше паузы не было вовсе: ответ
+# признавался готовым через 1.5 с неизменности текста, и следующий ход начинал
+# печататься через пару секунд — то есть «человек» осилил простыню на 3000
+# знаков быстрее, чем успел бы её проскроллить. Считаем время по объёму
+# прочитанного, с потолком, и проводим его не в мёртвом сне, а листая ответ.
+FOLLOWUP_READ_S_PER_100 = (1.1, 2.3)  # секунд на 100 символов ответа
+FOLLOWUP_READ_MIN_S = float(os.getenv("AIFARM_FOLLOWUP_READ_MIN_S", "5"))
+FOLLOWUP_READ_MAX_S = float(os.getenv("AIFARM_FOLLOWUP_READ_MAX_S", "45"))
+
+SCROLL_STEP_PX = (220, 520)     # дистанция одного жеста
+SCROLL_PAUSE_MS = (350, 1100)   # пауза на чтение между жестами
+SCROLL_TICK_PX = (8, 26)        # один щелчок внутри жеста
+SCROLL_TICK_MS = (12, 34)       # пауза между щелчками
 
 
 def _flag(name, default=True):
@@ -54,7 +166,7 @@ FLAG_BLOCK_WEBRTC = _flag("AIFARM_BLOCK_WEBRTC")      # блок утечки р
 FLAG_ACCEPT_CONSENT = _flag("AIFARM_ACCEPT_CONSENT")  # авто-принятие диалога согласия Google
 FLAG_DENOISE = _flag("AIFARM_DENOISE")                # чистка ответа AI Mode от UI-обвязки
 FLAG_SEED_COOKIES = _flag("AIFARM_SEED_COOKIES")      # инъекция куков (файл + дефолтное согласие)
-FLAG_BURN_ON_BLOCK = _flag("AIFARM_BURN_ON_BLOCK")    # сносить профиль/сессию при /sorry/
+FLAG_READ_SCROLL = _flag("AIFARM_READ_SCROLL")        # прокрутка ответа во время чтения
 
 # Денойз ответа AI Mode: убираем с клона ноды UI-обвязку. Список консервативный
 # и структурный (роли/теги, не классы Google — те гниют за недели). ВНИМАНИЕ:
@@ -95,6 +207,20 @@ def _clean_text(text: str) -> str:
         out.append(line)
     return "\n".join(out).strip()
 
+
+def _followup_key_layout(text: str) -> str:
+    """Набирает кириллицу теми же клавишами в английской раскладке."""
+    return text.translate(_RU_TO_EN_KEYS)
+
+
+def _ai_mode_url(search_url: str) -> str:
+    """Добавляет AI Mode к текущей выдаче, сохраняя запрос и параметры Google."""
+    parts = urlsplit(search_url)
+    query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+             if key != "udm"]
+    query.append(("udm", "50"))
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
 # Настройки, общие для любой личности (сам fingerprint-профиль/прокси —
 # за экземпляром Browser, см. Browser._launch_config). fonts/screen/window=None —
 # Camoufox сам берёт значения из реального распределения устройств, не трогаем.
@@ -120,6 +246,27 @@ _BASE_CONFIG = dict(
 
 class BlockedError(Exception):
     """Google принял браузер за бота (редирект на /sorry/, капча)."""
+
+
+class AnswerUnavailableError(Exception):
+    """Ответ не появился; screenshot содержит viewport для MCP-клиента."""
+
+    code = "answer_unavailable"
+
+    def __init__(self, message: str, screenshot: str | None = None):
+        super().__init__(message)
+        self.screenshot = screenshot
+
+
+class AnswerRefusedError(AnswerUnavailableError):
+    """Google принял вопрос, но ответа не дал («контент не сгенерирован»).
+
+    Это не блокировка: профиль цел, вкладка жива, /sorry/ не было. Наблюдается
+    на уточняющих вопросах с датацентрового адреса; тот же код на мобильном
+    прокси второй ход отрабатывает.
+    """
+
+    code = "answer_refused"
 
 
 class ProfilePoolExhaustedError(Exception):
@@ -209,6 +356,55 @@ def _next_proxy():
     return proxy
 
 
+def _read_camou_config(options: dict) -> dict:
+    """CAMOU_CONFIG из launch_options: он нарезан по env CAMOU_CONFIG_<n>."""
+    env = options.get("env") or {}
+    chunks = [
+        (int(name.rsplit("_", 1)[1]), value)
+        for name, value in env.items()
+        if name.startswith("CAMOU_CONFIG_")
+    ]
+    if not chunks:
+        return {}
+    return json.loads("".join(value for _, value in sorted(chunks)))
+
+
+def _clamp_window_position(device: dict) -> dict:
+    """Загоняет окно внутрь экрана. Camoufox этого не делает.
+
+    clamp_window_dimensions правит только ширину и высоту, а позицию
+    (window.screenX/screenY) отдаёт как есть из BrowserForge — там она
+    моделирует второй монитор и легко уезжает за пределы одиночного экрана
+    (наблюдали screenX=3432 при screen.width=1680). Пока позиция
+    перегенерировалась на каждом запуске, это была редкая неудача; в
+    закреплённом устройстве она бы осталась навсегда.
+    """
+    for axis, size, avail in (("X", "width", "availWidth"), ("Y", "height", "availHeight")):
+        limit = device.get(f"screen.{avail}") or device.get(f"screen.{size}")
+        window = device.get(f"window.outer{'Width' if axis == 'X' else 'Height'}")
+        position = device.get(f"window.screen{axis}")
+        if limit is None or window is None or position is None:
+            continue
+        device[f"window.screen{axis}"] = min(max(position, 0), max(0, limit - window))
+    return device
+
+
+def _generate_device() -> dict:
+    """Разовая генерация железа профиля: только постоянные свойства машины.
+
+    geoip выключен намеренно — география в устройство не попадает, её на каждом
+    запуске считает Camoufox по текущему exit-IP.
+    """
+    base = {key: value for key, value in _BASE_CONFIG.items() if key != "persistent_context"}
+    options = camoufox_launch_options(**{**base, "geoip": False})
+    config = _read_camou_config(options)
+    return _clamp_window_position({
+        key: value
+        for key, value in config.items()
+        if not key.startswith(VOLATILE_CONFIG_KEYS)
+    })
+
+
 class Browser:
     def __init__(self, worker_id: str = "worker"):
         self._worker_id = worker_id
@@ -226,6 +422,7 @@ class Browser:
             else []
         )
         self._profile_cursor = -1
+        self._profile_budget = 0
         self._new_identity()
 
     def _new_identity(self):
@@ -234,8 +431,9 @@ class Browser:
         requested = os.getenv("AIFARM_PROFILE_ID", "").strip()
         if profile_path:
             self._profile_dir = profile_path
+            self._reset_budget()
         elif self._profile_pool:
-            self._select_next_profile()
+            self._select_next_profile()  # норму выставит _take_profile
         else:
             identity = (
                 re.sub(r"[^A-Za-z0-9_-]", "_", requested)[:64]
@@ -243,26 +441,105 @@ class Browser:
                 else uuid.uuid4().hex[:8]
             )
             self._profile_dir = f"{PROFILES_DIR}/{self._worker_id}_{identity}"
+            self._reset_budget()
         self._proxy = _next_proxy()
 
     @property
     def profile_id(self) -> str | None:
         return Path(self._profile_dir).name if self._profile_dir else None
 
+    @staticmethod
+    def _blocked_at(profile: Path) -> datetime | None:
+        """Время блокировки из маркера. None — маркера нет либо он нечитаем."""
+        try:
+            return datetime.fromisoformat((profile / BLOCK_MARKER).read_text().strip())
+        except (OSError, ValueError):
+            return None
+
+    def _take_profile(self, index: int) -> str:
+        profile = self._profile_pool[index]
+        profile.mkdir(parents=True, exist_ok=True)
+        (profile / BLOCK_MARKER).unlink(missing_ok=True)  # вернулся в ротацию
+        self._profile_cursor = index
+        self._profile_dir = str(profile)
+        self._reset_budget()
+        return profile.name
+
+    def _reset_budget(self):
+        """Норма вопросов для только что взятого профиля, с разбросом."""
+        self._profile_budget = random.randint(
+            max(1, PROFILE_MAX_QUERIES - 2), max(1, PROFILE_MAX_QUERIES)
+        )
+
     def _select_next_profile(self) -> str | None:
+        """Следующий профиль по кругу: сначала остывшие, потом самый отдохнувший."""
+        cooling: list[tuple[datetime, int]] = []
+        now = datetime.now(UTC)
         for offset in range(1, len(self._profile_pool) + 1):
             index = (self._profile_cursor + offset) % len(self._profile_pool)
             profile = self._profile_pool[index]
-            if not (profile / ".needs_attention").exists():
-                profile.mkdir(parents=True, exist_ok=True)
-                self._profile_cursor = index
-                self._profile_dir = str(profile)
-                return profile.name
+            if not (profile / BLOCK_MARKER).exists():
+                return self._take_profile(index)
+            blocked_at = self._blocked_at(profile)
+            if blocked_at is None:
+                continue  # маркер поставлен руками — профиль ждёт ручного прогрева
+            if now - blocked_at >= PROFILE_COOLDOWN:
+                return self._take_profile(index)
+            cooling.append((blocked_at, index))
+        if cooling:  # все под блокировкой — берём тот, что отдыхал дольше всех
+            blocked_at, index = min(cooling)
+            print(f"все профили под блокировкой, беру {self._profile_pool[index].name} "
+                  f"(заблокирован {blocked_at.isoformat()})", flush=True)
+            return self._take_profile(index)
         self._profile_dir = None
         return None
 
     def _launch_config(self):
-        return {**_BASE_CONFIG, "user_data_dir": self._profile_dir, "proxy": self._proxy}
+        # config= переживает генерацию фингерпринта: merge_into внутри Camoufox
+        # ставит только отсутствующие ключи, поэтому сохранённое железо побеждает.
+        return {
+            **_BASE_CONFIG,
+            "locale": BROWSER_LOCALE,
+            "user_data_dir": self._profile_dir,
+            "proxy": self._proxy,
+            "config": self._device_config(),
+        }
+
+    def _device_config(self) -> dict:
+        """Железо профиля: при первом обращении создаётся, дальше только читается."""
+        path = Path(self._profile_dir) / DEVICE_FILE
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            saved = None
+        if saved is not None:
+            repaired = _clamp_window_position(dict(saved))
+            if repaired != saved:  # устройство записано до появления проверки
+                path.write_text(json.dumps(repaired, indent=1, sort_keys=True), encoding="utf-8")
+                print(f"профиль {self.profile_id}: окно возвращено в экран "
+                      f"({saved.get('window.screenX')},{saved.get('window.screenY')} -> "
+                      f"{repaired.get('window.screenX')},{repaired.get('window.screenY')})", flush=True)
+            return repaired
+        device = _generate_device()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(device, indent=1, sort_keys=True), encoding="utf-8")
+        print(f"профиль {self.profile_id}: заведено устройство "
+              f"{device.get('navigator.platform')} "
+              f"{device.get('screen.width')}x{device.get('screen.height')}", flush=True)
+        return device
+
+    def _rotate_by_load(self):
+        """Отработавший норму профиль уступает место следующему.
+
+        Проверяется только перед НОВЫМ поиском: follow-up обязан остаться на той
+        вкладке, где начался разговор, иначе продолжать нечего.
+        """
+        if PROFILE_MAX_QUERIES < 1 or not self._profile_pool or self._profile_budget > 0:
+            return
+        spent = self.profile_id
+        self.shutdown()
+        print(f"профиль {spent} отработал норму, перехожу на "
+              f"{self._select_next_profile()}", flush=True)
 
     def _ensure_browser(self):
         if self._profile_dir is None:
@@ -270,6 +547,11 @@ class Browser:
         if self._context is None:
             self._cm = Camoufox(**self._launch_config())
             self._context = self._cm.start()
+            # Потолок на КАЖДЫЙ вызов Playwright. Без него у части вызовов
+            # таймаута нет вовсе, и зависший браузер держит воркер бесконечно
+            # (наблюдали 36 минут и 17 минут). Явные timeout= в коде сильнее.
+            self._context.set_default_timeout(EL_TIMEOUT)
+            self._context.set_default_navigation_timeout(NAV_TIMEOUT)
             if FLAG_SEED_COOKIES:
                 self._seed_consent()
         return self._context
@@ -335,16 +617,103 @@ class Browser:
                 return  # кнопку не нашли — дальше по коду упрёмся и залогируем
             page.wait_for_timeout(1500)
 
+    _PUNCTUATION = ".,!?;:—…)»"
+
+    def _key_delay(self, typed: str) -> float:
+        """Пауза после набранного символа, мс."""
+        delay = random.lognormvariate(math.log(KEY_DELAY_MEDIAN_MS), KEY_DELAY_SIGMA)
+        delay = min(max(delay, KEY_DELAY_MIN_MS), KEY_DELAY_MAX_MS)
+        if typed in self._PUNCTUATION:
+            delay += random.uniform(80, 260)   # закончил мысль
+        elif typed == " ":
+            delay += random.uniform(40, 120)   # граница слова
+        if random.random() < THINK_PAUSE_CHANCE:
+            delay += random.uniform(300, 900)  # действительно задумался
+        return delay
+
     def _human_type(self, page, locator, text, focus=True):
         if focus:
             locator.click()
             page.wait_for_timeout(random.uniform(150, 400))  # прицелиться перед вводом
         for ch in text:
             page.keyboard.type(ch)
-            delay = random.uniform(70, 160)
-            if ch == " " or random.random() < 0.06:  # пауза на пробеле / изредка «задумался»
-                delay += random.uniform(120, 350)
-            page.wait_for_timeout(delay)
+            page.wait_for_timeout(self._key_delay(ch))
+
+    def _type_query(self, page, locator, text, focus=True):
+        """Длинный запрос: тело вставляем, вручную допечатываем только хвост."""
+        head, tail = text[:-HUMAN_TAIL_CHARS], text[-HUMAN_TAIL_CHARS:]
+        if not head:
+            self._human_type(page, locator, text, focus=focus)
+            return
+        if focus:
+            locator.click()
+        locator.fill(head)
+        page.wait_for_timeout(random.uniform(200, 500))  # перечитать вставленное
+        page.keyboard.press("End")
+        self._human_type(page, locator, tail, focus=False)
+
+    def _point_at_answer(self, page) -> bool:
+        """Ставит курсор внутрь блока ответа перед прокруткой.
+
+        page.mouse.wheel() крутит колесо ТАМ, ГДЕ СЕЙЧАС КУРСОР, а курсор после
+        старта стоит в углу (0,0). У AI Mode контент лежит в своём скроллящемся
+        контейнере, поэтому колесо из угла листало что угодно, только не ответ:
+        со стороны это «сгенерировал простыню и не сдвинул её ни на пиксель»,
+        то есть ровно тот признак, ради борьбы с которым прокрутка и писалась.
+        """
+        try:
+            box = page.locator(AI_ANSWER).last.bounding_box()
+        except Exception:
+            box = None
+        if not box:
+            return False
+        page.mouse.move(
+            box["x"] + box["width"] * random.uniform(0.35, 0.65),
+            box["y"] + box["height"] * random.uniform(0.25, 0.6),
+            steps=random.randint(6, 14),
+        )
+        page.wait_for_timeout(random.uniform(80, 260))
+        return True
+
+    def _scroll_gesture(self, page, distance):
+        """Один жест прокрутки: мелкие щелчки по синусоиде — разгон и торможение.
+
+        Вес каждого щелчка sin(pi * фаза): по краям жеста мелкие, в середине
+        крупные. Сумма нормируется на distance, поэтому куда доедем — известно,
+        а вот КАК доедем, выглядит как живая рука, а не как один телепорт.
+        """
+        ticks = max(6, int(distance / random.uniform(*SCROLL_TICK_PX)))
+        weights = [math.sin(math.pi * (i + 0.5) / ticks) for i in range(ticks)]
+        scale = distance / sum(weights)
+        for weight in weights:
+            page.mouse.wheel(0, weight * scale * random.uniform(0.85, 1.15))
+            page.wait_for_timeout(random.uniform(*SCROLL_TICK_MS))
+
+    def _read_scroll(self, page, steps=1):
+        """Прокрутка ответа в темпе чтения. Косметика: сбой не должен ронять поиск."""
+        if not FLAG_READ_SCROLL:
+            return
+        self._point_at_answer(page)  # без этого колесо крутится мимо ответа
+        for _ in range(steps):
+            try:
+                self._scroll_gesture(page, random.uniform(*SCROLL_STEP_PX))
+            except Exception as error:
+                print(f"прокрутка не прошла: {error.__class__.__name__}", flush=True)
+                return
+            page.wait_for_timeout(random.uniform(*SCROLL_PAUSE_MS))
+
+    def _read_pause_seconds(self, answer: str) -> float:
+        """Сколько «читать» предыдущий ответ перед уточняющим вопросом."""
+        per_100 = random.uniform(*FOLLOWUP_READ_S_PER_100)
+        seconds = len(answer) / 100 * per_100
+        return min(max(seconds, FOLLOWUP_READ_MIN_S), FOLLOWUP_READ_MAX_S)
+
+    def _read_answer(self, page, answer: str) -> None:
+        """Проводит паузу чтения, листая ответ, а не замерев на месте."""
+        deadline = time.monotonic() + self._read_pause_seconds(answer)
+        while time.monotonic() < deadline:
+            self._read_scroll(page)
+            page.wait_for_timeout(random.uniform(600, 1600))
 
     def _take_free_page(self, context):
         # Camoufox стартует с одной пустой about:blank вкладкой. Если её
@@ -354,19 +723,29 @@ class Browser:
                 return p
         return context.new_page()
 
+    def _take_search_page(self):
+        """Берёт вкладку, один раз перезапуская аварийно закрытый Camoufox."""
+        try:
+            return self._take_free_page(self._ensure_browser())
+        except TargetClosedError:
+            print("браузер закрылся, перезапускаю", flush=True)
+            self.shutdown()
+            return self._take_free_page(self._ensure_browser())
+
     def _open_ai_mode(self, page, prompt: str, human_tail: str = None):
         """google.com → ввод запроса → клик по вкладке "Режим ИИ" → ждём ответ.
 
         human_tail: если задан — prompt вставляется целиком (fill), а human_tail
         допечатывается по-человечески в конце (для длинного контекста + короткого
-        живого вопроса).
+        живого вопроса). Если не задан — хвост отрезается автоматически, см.
+        _type_query: посимвольно набирать весь длинный промпт нельзя.
         """
         page.goto(GOOGLE_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
         self._accept_cookies(page)
 
         box = page.locator(SEARCH_BOX)
         if human_tail is None:
-            self._human_type(page, box, prompt)
+            self._type_query(page, box, prompt)
         else:
             box.click()
             box.fill(prompt)
@@ -378,28 +757,44 @@ class Browser:
         page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
         _check_blocked(page)
 
-        # Переход в AI Mode кликом по вкладке "Режим ИИ" (a[href*="udm=50"]) —
-        # как это делает человек; SPA-переход, без конструирования URL.
+        # Обычно переходим кликом по вкладке. Google иногда убирает её из шапки
+        # обычной выдачи; тогда открываем ту же выдачу с udm=50 напрямую.
         link = page.locator(AI_MODE_LINK).first
-        link.wait_for(state="visible", timeout=EL_TIMEOUT)
-        page.wait_for_timeout(random.uniform(300, 900))
-        link.click()
+        try:
+            link.wait_for(state="visible", timeout=EL_TIMEOUT)
+        except Exception:
+            page.goto(_ai_mode_url(page.url), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+        else:
+            page.wait_for_timeout(random.uniform(300, 900))
+            link.click()
         page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
         _check_blocked(page)
-        page.locator(AI_ANSWER).last.wait_for(state="visible", timeout=EL_TIMEOUT)
+        try:
+            page.locator(AI_ANSWER).last.wait_for(state="visible", timeout=EL_TIMEOUT)
+        except Exception as error:
+            self._dump_page(page, "answer_missing")
+            _check_blocked(page)
+            raise AnswerUnavailableError(
+                "контейнер ответа AI Mode не появился", self._capture_screenshot(page)
+            ) from error
 
     def new_search_session(self, user_session_id: str, query: str) -> str:
         """Открывает вкладку, ищет query, переходит в AI Mode. Возвращает session_id."""
         self._expire_sessions()
-        context = self._ensure_browser()
-        page = self._take_free_page(context)
+        self._rotate_by_load()
+        self._profile_budget -= 1
+        page = self._take_search_page()
         page.bring_to_front()
         try:
             self._open_ai_mode(page, query)
-        except Exception:
+        except AnswerUnavailableError:
+            raise
+        except Exception as error:
             self._dump_page(page, "fail")
             _check_blocked(page)  # /sorry/ мог прилететь редиректом уже после проверки
-            raise
+            raise AnswerUnavailableError(
+                "AI Mode не открылся", self._capture_screenshot(page)
+            ) from error
 
         session_id = uuid.uuid4().hex[:8]
         session = SearchSession(page, user_session_id, datetime.now(UTC))
@@ -410,28 +805,68 @@ class Browser:
     def ask_followup(self, user_session_id: str, session_id: str, query: str) -> None:
         """Задаёт новый вопрос в том же диалоге AI Mode, той же вкладкой."""
         session = self._session(user_session_id, session_id)
+        self._profile_budget -= 1
         page = session.page
         page.bring_to_front()
 
         previous_answers = page.locator(AI_ANSWER).count()
+        previous_text = page.locator(AI_ANSWER).last.inner_text().strip() if previous_answers else ""
+        # Сначала дочитываем предыдущий ответ и только потом тянемся к полю:
+        # без этой паузы следующий вопрос начинал печататься через пару секунд
+        # после того, как Google дописал простыню.
+        self._read_answer(page, previous_text)
+
         box = page.locator(FOLLOWUP_INPUT).first
-        box.wait_for(state="visible", timeout=EL_TIMEOUT)
-        self._human_type(page, box, query)
-        page.wait_for_timeout(random.uniform(200, 500))
+        try:
+            box.wait_for(state="visible", timeout=EL_TIMEOUT)
+        except Exception as error:
+            self._dump_page(page, "followup_input_missing")
+            _check_blocked(page)
+            raise AnswerUnavailableError(
+                "поле уточняющего вопроса AI Mode не найдено",
+                self._capture_screenshot(page),
+            ) from error
+        sent_query = _followup_key_layout(query)
+        self._type_query(page, box, sent_query)
+        page.wait_for_timeout(random.uniform(600, 1800))  # перечитать набранное перед отправкой
         box.press("Enter")
 
+        # Ждём ЛИБО ответ, ЛИБО отказ. Ответ приходит двумя способами: новый
+        # main-col или дописанный текст в существующем. Отказ Google рисует
+        # своим блоком ANSWER_ERROR («контент не сгенерирован») — без этой
+        # ветки мы просто выстаивали все ANSWER_START_TIMEOUT и возвращали
+        # невнятный таймаут вместо понятной причины.
         try:
             page.wait_for_function(
-                f"expected => document.querySelectorAll('{AI_ANSWER}').length > expected",
-                arg=previous_answers,
-                timeout=EL_TIMEOUT,
+                """([selector, count, text, errorSelector]) => {
+                    if (document.querySelector(errorSelector)) return true;
+                    const blocks = document.querySelectorAll(selector);
+                    if (blocks.length > count) return true;
+                    const last = blocks[blocks.length - 1];
+                    return !!last && last.innerText.trim() !== text;
+                }""",
+                arg=[AI_ANSWER, previous_answers, previous_text, ANSWER_ERROR],
+                timeout=ANSWER_START_TIMEOUT,
             )
         except Exception:
+            # Скриншот + HTML именно в момент, когда ответа не дождались:
+            # понять, ушёл ли вопрос вообще и что показывает страница, иначе
+            # можно только гадать по таймауту.
+            self._dump_page(page, "followup_fail")
             _check_blocked(page)
-            raise
+            raise AnswerUnavailableError(
+                "ответ на уточняющий вопрос не появился", self._capture_screenshot(page)
+            ) from None
+
+        refusals = page.locator(ANSWER_ERROR)
+        if refusals.count() > 0:
+            self._dump_page(page, "followup_refused")
+            raise AnswerRefusedError(
+                refusals.last.inner_text().strip()[:200], self._capture_screenshot(page)
+            )
 
         # get_last_ai_answer() fills the answer after the worker receives it.
-        session.transcript.append([query, None])
+        session.transcript.append([sent_query, None])
 
     def get_last_ai_answer(self, user_session_id: str, session_id: str) -> str:
         """Текст ответа AI Mode на последний вопрос этой сессии.
@@ -449,6 +884,7 @@ class Browser:
         deadline = time.monotonic() + STREAM_TIMEOUT
         previous = ""
         stable_since = time.monotonic()
+        next_scroll = time.monotonic() + random.uniform(1.5, 3.0)
         while time.monotonic() < deadline:
             current = answer.inner_text().strip()
             now = time.monotonic()
@@ -459,11 +895,24 @@ class Browser:
                 if os.getenv("AIFARM_DUMP_ANSWER"):
                     self._dump_page(page, "ok")
                 text = self._denoise(answer, current)
+                # Если ответ дописался в тот же блок, в тексте лежит и прошлый
+                # ход диалога — отдавать его повторно нельзя.
+                if len(session.transcript) >= 2:
+                    earlier = session.transcript[-2][1]
+                    if earlier and text.startswith(earlier):
+                        text = text[len(earlier):].lstrip()
                 if session.transcript and session.transcript[-1][1] is None:
                     session.transcript[-1][1] = text  # для контекста будущих follow-up
+                self._read_scroll(page, steps=random.randint(2, 4))  # дочитать до конца
                 return text
-            page.wait_for_timeout(250)
-        raise TimeoutError("AI answer did not finish streaming")
+            if now >= next_scroll:  # читаем по мере того, как текст пишется
+                self._read_scroll(page)
+                next_scroll = time.monotonic() + random.uniform(1.2, 2.5)
+            else:
+                page.wait_for_timeout(250)
+        raise AnswerUnavailableError(
+            "ответ AI Mode не завершил генерацию", self._capture_screenshot(page)
+        )
 
     def _denoise(self, answer, raw: str) -> str:
         """Чистит ответ AI Mode от UI-обвязки (кнопки-цитаты, иконки, сноски).
@@ -483,6 +932,15 @@ class Browser:
         if os.getenv("AIFARM_DUMP_ANSWER"):
             self._dump_answer(answer, raw, cleaned)
         return cleaned
+
+    @staticmethod
+    def _capture_screenshot(page) -> str | None:
+        """Viewport PNG для возврата клиенту; диагностика не должна зависнуть."""
+        try:
+            png = page.screenshot(type="png", full_page=False, timeout=5000)
+            return base64.b64encode(png).decode("ascii")
+        except Exception:
+            return None
 
     def _dump_page(self, page, tag: str):
         """Скриншот + HTML + URL страницы при сбое — включается AIFARM_DUMP_ANSWER."""
@@ -567,15 +1025,17 @@ class Browser:
         self._sessions.clear()
 
     def burn_and_rotate(self):
-        """Сохраняет проблемный профиль и выбирает следующий, не повторяя запрос."""
+        """Помечает профиль временем блокировки и переключается на следующий.
+
+        Ничего не удаляется: профиль с куками остаётся на диске и вернётся в
+        ротацию сам через PROFILE_COOLDOWN (см. _select_next_profile).
+        """
         if self._profile_pool:
             blocked_profile = self.profile_id
-            marker = Path(self._profile_dir) / ".needs_attention"
+            marker = Path(self._profile_dir) / BLOCK_MARKER
             marker.write_text(datetime.now(UTC).isoformat(), encoding="utf-8")
             self.shutdown()
             return blocked_profile, self._select_next_profile()
-        if not FLAG_BURN_ON_BLOCK:
-            return self.profile_id, None
         old_profile_dir = self._profile_dir
         self.shutdown()
         self._new_identity()

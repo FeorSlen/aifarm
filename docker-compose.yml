@@ -24,7 +24,9 @@ services:
       WORKER_ID: ${WORKER_ID:-worker1}
       AIFARM_USER_ID: ${AIFARM_USER_ID:-}
       AIFARM_MCP_HOST: ${AIFARM_MCP_HOST:-127.0.0.1}
-      AIFARM_SEARCH_TIMEOUT_S: ${AIFARM_SEARCH_TIMEOUT_S:-180}
+      AIFARM_SEARCH_TIMEOUT_S: ${AIFARM_SEARCH_TIMEOUT_S:-600}
+      AIFARM_FIRST_QUERY_MAX: ${AIFARM_FIRST_QUERY_MAX:-200}       # первый вопрос идёт в строку google.com
+      AIFARM_FOLLOWUP_QUERY_MAX: ${AIFARM_FOLLOWUP_QUERY_MAX:-4000}  # продолжение — в поле AI Mode
     ports:
       # публичный доступ на VPS: GATEWAY_BIND=0.0.0.0:8000 (+ AIFARM_MCP_HOST=0.0.0.0)
       - "${GATEWAY_BIND:-127.0.0.1:8000}:8000"
@@ -37,24 +39,36 @@ services:
   worker:
     build: .
     restart: unless-stopped
-    command: /bin/sh -c 'rm -f /tmp/.X99-lock /tmp/.X11-unix/X99; Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp & export DISPLAY=:99; exec python -m src.worker.worker'
+    command: /bin/sh -c 'rm -f /tmp/.X99-lock /tmp/.X11-unix/X99; Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp & export DISPLAY=:99; sleep 1; x11vnc -display :99 -forever -shared -nopw -rfbport 5900 -listen 0.0.0.0 -quiet & exec python -m src.worker.worker'
     environment:
       <<: *app-environment
+      # Browser/AI requests are deliberately synchronous and can run for several
+      # minutes. Disable AMQP heartbeats on this connection so RabbitMQ does not
+      # redeliver an in-flight task while the consumer callback is still busy.
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-aifarm}:${RABBITMQ_PASSWORD:?copy .env.example to .env and set RABBITMQ_PASSWORD}@rabbitmq:5672/%2F?heartbeat=0
       GOOGLE_HEADLESS: ${GOOGLE_HEADLESS:-false}
       PROFILES_DIR: /data/profiles
+      AIFARM_PROFILE_ROOT: ${AIFARM_PROFILE_ROOT:-/data/profiles}
+      AIFARM_PROFILE_COUNT: ${AIFARM_PROFILE_COUNT:-10}  # размер пула user1…userN; должен совпадать с числом заведённых профилей
       PROXY_URL: ${PROXY_URL:-}                        # http://user:pass@host:port; пусто = прямое
       GOOGLE_COOKIES_FILE: ${GOOGLE_COOKIES_FILE:-}    # /app/cookies.txt (Netscape/JSON)
       AIFARM_DUMP_ANSWER: ${AIFARM_DUMP_ANSWER:-}      # каталог дампа ответа/сбоя, напр. /data/profiles/dump
-      AIFARM_SEED_COOKIES: ${AIFARM_SEED_COOKIES:-true}
+      AIFARM_SEED_COOKIES: ${AIFARM_SEED_COOKIES:-false}  # авторизованный профиль уже хранит consent; не перезаписываем SOCS
+      AIFARM_READ_SCROLL: ${AIFARM_READ_SCROLL:-true}
       AIFARM_ACCEPT_CONSENT: ${AIFARM_ACCEPT_CONSENT:-true}
-      AIFARM_BURN_ON_BLOCK: ${AIFARM_BURN_ON_BLOCK:-true}
+      AIFARM_PROFILE_COOLDOWN_H: ${AIFARM_PROFILE_COOLDOWN_H:-6}  # через сколько часов профиль после /sorry/ снова в ротации
+      AIFARM_PROFILE_MAX_QUERIES: ${AIFARM_PROFILE_MAX_QUERIES:-12}  # вопросов на профиль до плановой смены; 0 = только по /sorry/
       AIFARM_HUMANIZE: ${AIFARM_HUMANIZE:-true}
       AIFARM_GEOIP: ${AIFARM_GEOIP:-true}
+      AIFARM_LOCALE: ${AIFARM_LOCALE:-fr-FR}         # один язык между запусками; регион/TZ всё ещё берутся из geoip
       AIFARM_BLOCK_WEBRTC: ${AIFARM_BLOCK_WEBRTC:-true}
       AIFARM_DENOISE: ${AIFARM_DENOISE:-true}
       NAV_TIMEOUT_MS: ${NAV_TIMEOUT_MS:-45000}
       EL_TIMEOUT_MS: ${EL_TIMEOUT_MS:-20000}
       STREAM_TIMEOUT_S: ${STREAM_TIMEOUT_S:-45}
+      ANSWER_START_TIMEOUT_S: ${ANSWER_START_TIMEOUT_S:-60}  # ожидание нового блока ответа на уточняющий вопрос
+    ports:
+      - "${VNC_BIND:-127.0.0.1:5900}:5900"
     volumes:
       - .:/app
       - browser-profiles:/data/profiles

@@ -3,7 +3,7 @@ import time
 
 import pika
 
-from .browser import BlockedError, Browser, ProfilePoolExhaustedError
+from .browser import AnswerUnavailableError, BlockedError, Browser, ProfilePoolExhaustedError
 from src.config import RABBITMQ_URL, TASK_EXCHANGE, WORKER_ID
 from src.contract import Result, Task
 
@@ -41,6 +41,12 @@ def handle(browser: Browser, task: Task) -> Result:
             sessions=sessions,
             profile_id=profile_id,
             next_profile_id=next_profile_id,
+        )
+    except AnswerUnavailableError as error:
+        # Вкладка и профиль остаются живы; screenshot уходит MCP-клиенту.
+        log.warning("answer unavailable (%s): %s", error.code, error)
+        return Result(
+            session_id=session_id, error=error.code, screenshot=error.screenshot
         )
     except ProfilePoolExhaustedError:
         return Result(error="human_action_required")

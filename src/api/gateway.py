@@ -36,8 +36,18 @@ app = FastAPI(lifespan=lifespan)
 # Host: localhost / 127.0.0.1 / [::1]. Для публичного порта на VPS поставить
 # AIFARM_MCP_HOST=0.0.0.0 — это ПОЛНОСТЬЮ выключает guard, так что только за
 # доверенным прокси/файрволом (аутентификации у сервера нет).
+#
+# stateless_http=True: без MCP-сессий, каждый HTTP-запрос — свой транспорт.
+# С сессиями клиент, у которого во время длинного search (250+ с) отвалился
+# отдельный GET-SSE-стрим, при реконнекте вечно получал 409 "Only one SSE
+# stream is allowed per session" — сервер не замечал разрыв, т.к. в этот стрим
+# ничего не пишется. Серверного состояния на сессию у нас нет (арендатор — в
+# заголовке X-Aifarm-User, вкладки живут на воркере), прогресс идёт в поток
+# ответа самого POST, так что сессии не нужны.
 _mcp_host = os.getenv("AIFARM_MCP_HOST", "127.0.0.1")
-app.router.routes.extend(mcp_module.mcp.streamable_http_app(host=_mcp_host).routes)
+app.router.routes.extend(
+    mcp_module.mcp.streamable_http_app(host=_mcp_host, stateless_http=True).routes
+)
 
 
 @app.get("/health")
