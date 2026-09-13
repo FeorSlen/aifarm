@@ -872,8 +872,9 @@ class Browser:
         """
         try:
             self._click_unstable(locator)
-        except Exception:
-            print("поле не далось даже force-клику, ставлю фокус напрямую", flush=True)
+        except Exception as error:
+            print(f"поле не далось даже force-клику ({self._click_diagnostics(page, locator, error)}), "
+                  "ставлю фокус напрямую", flush=True)
             locator.focus()
         page.wait_for_timeout(random.uniform(150, 400))  # прицелиться перед вводом
 
@@ -1036,14 +1037,53 @@ class Browser:
         return (f"visibility={state['visibility']} focus={state['focus']} "
                 f"rAF={state['frames']} кадров/{state['ms']} мс, страниц={pages}")
 
+    def _click_diagnostics(self, page, locator, error) -> str:
+        """Разбор клика, который не прошёл: на каком шаге Playwright встал и что под точкой.
+
+        Первая строка ошибки («Timeout 6000ms exceeded») ничего не говорит; причина
+        видна в call log (ожидание, прокрутка, движение мыши, перехват события) и
+        в том, какой элемент реально лежит под центром цели.
+        """
+        # Диагностика стоит в ветке сбоя: сама она не имеет права бросить исключение,
+        # иначе воркер вылетит из фолбэка с чужой ошибкой вместо запасного пути.
+        try:
+            lines = [line.strip() for line in str(error).splitlines() if line.strip()]
+            call_log = " | ".join(lines[1:])[-700:]
+            try:
+                box = locator.bounding_box(timeout=2000)
+            except Exception:
+                box = None
+            hit = viewport = None
+            try:
+                viewport = page.evaluate(
+                    "() => [window.innerWidth, window.innerHeight, window.scrollX, window.scrollY]"
+                )
+                if box:
+                    hit = page.evaluate("""([x, y]) => {
+                        const node = document.elementFromPoint(x, y);
+                        if (!node) return null;
+                        const cls = typeof node.className === 'string' ? node.className.trim() : '';
+                        return node.tagName + (cls ? '.' + cls.split(/\\s+/).slice(0, 2).join('.') : '')
+                            + (node.getAttribute('aria-label') ? '[' + node.getAttribute('aria-label').slice(0, 30) + ']' : '');
+                    }""", [box["x"] + box["width"] / 2, box["y"] + box["height"] / 2])
+            except Exception as probe_error:
+                hit = f"замер не удался: {type(probe_error).__name__}"
+            box_text = (f"{box['x']:.0f},{box['y']:.0f} {box['width']:.0f}x{box['height']:.0f}"
+                        if box else None)
+            return (f"{self._render_state(page)}; цель={box_text}; окно={viewport}; "
+                    f"под центром={hit}; call log: {call_log}")
+        except Exception as diagnostics_error:
+            return f"диагностика не удалась: {type(diagnostics_error).__name__}"
+
     def _arm_ai_mode(self, page) -> bool:
         """Клик по плашке «Режим ИИ» на главной. True — форма переключилась."""
+        chip = page.locator(AI_MODE_CHIP).first
         try:
-            self._click_unstable(page.locator(AI_MODE_CHIP).first)
+            self._click_unstable(chip)
             page.locator(AI_MODE_ARMED).wait_for(state="attached", timeout=AI_MODE_ARM_TIMEOUT)
         except Exception as error:
             reason = str(error).splitlines()[0][:80] if str(error) else type(error).__name__
-            print(f"плашка AI Mode не сработала ({reason}; {self._render_state(page)}), "
+            print(f"плашка AI Mode не сработала ({reason}; {self._click_diagnostics(page, chip, error)}), "
                   "иду через обычную выдачу", flush=True)
             return False
         page.wait_for_timeout(random.uniform(250, 700))  # глазом к полю
