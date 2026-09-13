@@ -1008,6 +1008,34 @@ class Browser:
         except Exception:
             locator.click(timeout=FIELD_CLICK_TIMEOUT, force=True)
 
+    @staticmethod
+    def _render_state(page) -> str:
+        """Замер для лога, когда клик не прошёл: живёт ли отрисовка страницы.
+
+        Клики (в том числе force) и проверка «stable» в Firefox идут через цикл
+        отрисовки, а клавиатура — нет. Когда клики падают при живой клавиатуре и
+        простаивающем процессоре, решает одно: приходят ли кадры. Замер без
+        таймаута Playwright не повиснет: setTimeout отпускает его за 1.5 с.
+        """
+        try:
+            state = page.evaluate("""() => new Promise((resolve) => {
+                const started = performance.now();
+                let frames = 0;
+                const tick = () => { frames += 1; requestAnimationFrame(tick); };
+                requestAnimationFrame(tick);
+                setTimeout(() => resolve({
+                    visibility: document.visibilityState,
+                    focus: document.hasFocus(),
+                    frames: frames,
+                    ms: Math.round(performance.now() - started),
+                }), 1000);
+            })""")
+            pages = len(page.context.pages)
+        except Exception as error:
+            return f"замер не удался: {type(error).__name__}"
+        return (f"visibility={state['visibility']} focus={state['focus']} "
+                f"rAF={state['frames']} кадров/{state['ms']} мс, страниц={pages}")
+
     def _arm_ai_mode(self, page) -> bool:
         """Клик по плашке «Режим ИИ» на главной. True — форма переключилась."""
         try:
@@ -1015,7 +1043,8 @@ class Browser:
             page.locator(AI_MODE_ARMED).wait_for(state="attached", timeout=AI_MODE_ARM_TIMEOUT)
         except Exception as error:
             reason = str(error).splitlines()[0][:80] if str(error) else type(error).__name__
-            print(f"плашка AI Mode не сработала ({reason}), иду через обычную выдачу", flush=True)
+            print(f"плашка AI Mode не сработала ({reason}; {self._render_state(page)}), "
+                  "иду через обычную выдачу", flush=True)
             return False
         page.wait_for_timeout(random.uniform(250, 700))  # глазом к полю
         return True
@@ -1048,12 +1077,23 @@ class Browser:
                 self._attach(page, pending)
                 pending = []
             except AttachmentError as error:
+                if not prompt.strip():
+                    raise  # без текста отложить вложения некуда, см. ниже
                 # Часть файлов могла прикрепиться — начисто открываем главную,
                 # чтобы ни один не ушёл дважды.
                 print(f"вложения на главной не прикрепились ({error}); "
                       "отправлю их после первого ответа", flush=True)
                 page.goto(GOOGLE_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
                 self._arm_ai_mode(page)
+        if pending and not prompt.strip():
+            # Запасной путь начинается с поиска по тексту, а текста нет: пустой
+            # Enter ушёл бы пустым запросом в обычный поиск. Прямого адреса,
+            # переключающего форму, нет (?atvm=2 проверен — не переключает).
+            raise AttachmentError(
+                "плашка AI Mode не сработала, а без текста вопроса обычный путь "
+                "невозможен — добавьте текст",
+                self._capture_screenshot(page),
+            )
 
         box = page.locator(SEARCH_BOX)
         if human_tail is None:

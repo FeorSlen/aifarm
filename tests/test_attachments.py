@@ -59,9 +59,8 @@ class MessageContractTest(unittest.TestCase):
     def test_new_conversation_may_carry_attachments_with_its_question(self):
         Task(user_session_id="u", query="what is this", attachments=[IMAGE])
 
-    def test_new_conversation_starts_with_text(self):
-        with self.assertRaises(ValidationError):
-            Task(user_session_id="u", query="", attachments=[IMAGE])
+    def test_new_conversation_may_be_attachments_only(self):
+        Task(user_session_id="u", query="", attachments=[IMAGE])
 
     def test_message_needs_text_or_attachments(self):
         with self.assertRaises(ValidationError):
@@ -75,10 +74,11 @@ class MessageContractTest(unittest.TestCase):
 
 
 class McpMessageCheckTest(unittest.TestCase):
-    def test_new_conversation_takes_attachments_with_a_question(self):
+    def test_new_conversation_takes_attachments_with_or_without_a_question(self):
         _check_message("what is this", None, [FILE_ID])
+        _check_message("", None, [FILE_ID])
         with self.assertRaises(ToolError):
-            _check_message("", None, [FILE_ID])
+            _check_message("", None, [])
 
     def test_empty_question_is_allowed_only_with_attachments(self):
         with self.assertRaises(ToolError):
@@ -192,7 +192,7 @@ class AttachInFollowupTest(unittest.TestCase):
 class FirstQuestionAttachmentsTest(unittest.TestCase):
     """Первый вопрос с вложениями: быстрый путь через плашку и запасной."""
 
-    def open_ai_mode(self, armed, attach_error=None):
+    def open_ai_mode(self, armed, attach_error=None, prompt="what is this"):
         browser = Browser.__new__(Browser)
         browser._accept_cookies = lambda _page: None
         steps = []
@@ -214,7 +214,8 @@ class FirstQuestionAttachmentsTest(unittest.TestCase):
         page.locator.side_effect = lambda selector: {
             SEARCH_BOX: box, AI_ANSWER: MagicMock(), AI_MODE_LINK: MagicMock(),
         }[selector]
-        pending = browser._open_ai_mode(page, "what is this", attachments=[IMAGE])
+        browser._capture_screenshot = lambda _page: None
+        pending = browser._open_ai_mode(page, prompt, attachments=[IMAGE])
         return steps, pending, page
 
     def test_chip_path_sends_attachments_together_with_the_question(self):
@@ -235,6 +236,20 @@ class FirstQuestionAttachmentsTest(unittest.TestCase):
         self.assertEqual(steps, ["arm", ("attach", ["cat.png"]), "arm", ("type", "what is this")])
         self.assertEqual(pending, [IMAGE])
         self.assertEqual(page.goto.call_count, 2)  # ни один файл не уйдёт дважды
+
+    def test_attachments_only_message_goes_through_the_chip_with_empty_text(self):
+        steps, pending, _ = self.open_ai_mode(armed=True, prompt="")
+
+        self.assertEqual(steps, ["arm", ("attach", ["cat.png"]), ("type", "")])
+        self.assertEqual(pending, [])
+
+    def test_attachments_only_message_without_chip_is_refused_not_searched_empty(self):
+        with self.assertRaises(AttachmentError):
+            self.open_ai_mode(armed=False, prompt="")
+
+    def test_attachments_only_message_is_refused_when_homepage_rejects_files(self):
+        with self.assertRaises(AttachmentError):
+            self.open_ai_mode(armed=True, attach_error=AttachmentError("нет «+»"), prompt="")
 
     def handle_new(self, pending):
         calls = []

@@ -137,15 +137,9 @@ def resolve_user(raw: str | None) -> str:
 
 
 def _check_message(question: str, tab_id: str | None, file_ids: list[str]) -> None:
-    """Сообщение — текст, вложения или и то и другое; новая беседа — с текстом."""
-    if question.strip():
-        return
-    if not file_ids:
+    """Сообщение — текст, вложения или и то и другое, в новой беседе тоже."""
+    if not question.strip() and not file_ids:
         raise ToolError("Вопрос не может быть пустым")
-    if not tab_id:
-        raise ToolError(
-            "Новая беседа начинается с текста вопроса; картинки и файлы приложите к нему же."
-        )
 
 
 def _user(ctx: Context) -> str:
@@ -175,7 +169,7 @@ async def search(
             max_length=FOLLOWUP_QUERY_MAX_CHARS,
             description=(
                 "Короткий естественный вопрос на английском языке; один вызов — один "
-                "вопрос. Пустым может быть только в продолжении беседы (с tab_id) и при file_ids. Без tab_id "
+                "вопрос. Пустым может быть только при file_ids. Без tab_id "
                 f"(первый вопрос беседы) — максимум {FIRST_QUERY_MAX_CHARS} символов, "
                 f"с tab_id — до {FOLLOWUP_QUERY_MAX_CHARS}."
             ),
@@ -198,8 +192,8 @@ async def search(
             description=(
                 "Вложения сообщения: file_id картинок и файлов, заранее загруженных в "
                 "шлюз (POST /files, multipart-поле file, тот же заголовок X-Aifarm-User). "
-                "Можно и в новую беседу (вместе с вопросом), и в продолжение (с tab_id; "
-                f"тогда question может быть пустым). Не больше {uploads.MAX_ATTACHMENTS}."
+                "Можно и в новую беседу, и в продолжение (с tab_id); с вложениями "
+                f"question может быть пустым. Не больше {uploads.MAX_ATTACHMENTS}."
             ),
         ),
     ] = None,
@@ -319,8 +313,9 @@ async def search(
         )
     if code == "attachment_failed":
         return _diagnostic_error(
-            "Вложения не удалось прикрепить к беседе: Google их не принял или они не "
-            "загрузились. Вкладка и профиль целы, search можно повторить.",
+            "Вложения не удалось отправить: Google их не принял, они не загрузились или "
+            "для сообщения без текста не открылся режим ИИ на главной (тогда добавьте "
+            "текст вопроса). Профиль цел, search можно повторить.",
             result.get("screenshot"),
         )
     if code == "tab_not_found":
