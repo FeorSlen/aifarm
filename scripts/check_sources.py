@@ -22,6 +22,7 @@
 
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -68,11 +69,18 @@ def main():
     browser = Browser(worker_id="check")
     try:
         print(f"профиль: {browser.profile_id}", flush=True)
+        started = time.monotonic()
         session_id = browser.new_search_session("check", QUESTION)
         report(browser, session_id, "вопрос")
+        print(f"\n⏱ вопрос: {time.monotonic() - started:.1f} с (от старта до готового ответа)", flush=True)
         if FOLLOWUP:
+            started = time.monotonic()
             browser.ask_followup("check", session_id, FOLLOWUP)
+            sent = time.monotonic()
             report(browser, session_id, "уточнение")
+            print(f"\n⏱ уточнение: {time.monotonic() - started:.1f} с всего; "
+                  f"до появления ответа {sent - started:.1f} с (чтение + ввод + ожидание Google), "
+                  f"дописывание и чтение ответа {time.monotonic() - sent:.1f} с", flush=True)
     finally:
         browser.shutdown()
 

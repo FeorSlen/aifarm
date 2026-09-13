@@ -164,14 +164,21 @@ THINK_PAUSE_CHANCE = 0.02   # доля нажатий, перед которым
 # печататься через пару секунд — то есть «человек» осилил простыню на 3000
 # знаков быстрее, чем успел бы её проскроллить. Считаем время по объёму
 # прочитанного, с потолком, и проводим его не в мёртвом сне, а листая ответ.
-FOLLOWUP_READ_S_PER_100 = (1.1, 2.3)  # секунд на 100 символов ответа
-FOLLOWUP_READ_MIN_S = float(os.getenv("AIFARM_FOLLOWUP_READ_MIN_S", "5"))
-FOLLOWUP_READ_MAX_S = float(os.getenv("AIFARM_FOLLOWUP_READ_MAX_S", "45"))
+# Темп задан владельцем: одна фаза чтения на ответ, 2–3 остановки прокрутки и не
+# дольше 4 с вместе с наведением курсора. Раньше между вопросами скрипт стоял до
+# 45 с: листал во время генерации, дочитывал в конце и ещё раз перед уточнением.
+FOLLOWUP_READ_S_PER_100 = (0.15, 0.3)  # секунд на 100 символов ответа
+FOLLOWUP_READ_MIN_S = float(os.getenv("AIFARM_FOLLOWUP_READ_MIN_S", "1.5"))
+FOLLOWUP_READ_MAX_S = float(os.getenv("AIFARM_FOLLOWUP_READ_MAX_S", "4"))
+READ_STOPS = (2, 3)  # остановок прокрутки на одно чтение
 
+# Жест стоил 0.5–1.3 с: десятки щелчков по 8–26 px, после каждого пауза
+# 12–34 мс, и каждый щелчок — отдельный вызов в браузер. Щелчок крупнее и чаще:
+# жест укладывается в ~0.3 с и всё ещё не прыжок (щелчок < 60 px).
 SCROLL_STEP_PX = (220, 520)     # дистанция одного жеста
-SCROLL_PAUSE_MS = (350, 1100)   # пауза на чтение между жестами
-SCROLL_TICK_PX = (8, 26)        # один щелчок внутри жеста
-SCROLL_TICK_MS = (12, 34)       # пауза между щелчками
+SCROLL_PAUSE_MS = (300, 650)    # пауза на чтение между жестами
+SCROLL_TICK_PX = (16, 30)       # один щелчок внутри жеста
+SCROLL_TICK_MS = (4, 10)        # пауза между щелчками
 
 
 def _flag(name, default=True):
@@ -429,6 +436,7 @@ class SearchSession:
     created_at: datetime
     transcript: list = None  # [(вопрос, ответ), ...] — для контекста follow-up
     sources: list = None     # источники последнего ответа: [{index, url, title}, ...]
+    answer_read: bool = False  # последний ответ уже прочитан (прокручен) — второй раз не листаем
 
     def __post_init__(self):
         if self.transcript is None:
@@ -817,10 +825,9 @@ class Browser:
         печатает. Поэтому промах клика не повод валить поиск: ставим фокус.
         """
         try:
-            locator.click(timeout=FIELD_CLICK_TIMEOUT)
+            self._click_unstable(locator)
         except Exception:
-            print("поле не далось клику (playwright: not stable), ставлю фокус напрямую",
-                  flush=True)
+            print("поле не далось даже force-клику, ставлю фокус напрямую", flush=True)
             locator.focus()
         page.wait_for_timeout(random.uniform(150, 400))  # прицелиться перед вводом
 
@@ -881,18 +888,31 @@ class Browser:
             page.mouse.wheel(0, weight * scale * random.uniform(0.85, 1.15))
             page.wait_for_timeout(random.uniform(*SCROLL_TICK_MS))
 
-    def _read_scroll(self, page, steps=1):
-        """Прокрутка ответа в темпе чтения. Косметика: сбой не должен ронять поиск."""
+    def _read_scroll(self, page, steps=1, point=True, deadline=None):
+        """Прокрутка ответа в темпе чтения. Косметика: сбой не должен ронять поиск.
+
+        point: навести курсор на ответ перед жестом. Нужно один раз на фазу
+        чтения — дальше курсор и так над ответом. Раньше он перед КАЖДЫМ жестом
+        перелетал в новую случайную точку ответа: мышь моталась туда-сюда, и с
+        humanize каждый перелёт стоил до 1.5 с.
+        """
         if not FLAG_READ_SCROLL:
             return
-        self._point_at_answer(page)  # без этого колесо крутится мимо ответа
-        for _ in range(steps):
+        if point:
+            self._point_at_answer(page)  # без этого колесо крутится мимо ответа
+        for step in range(steps):
+            # Первая остановка всегда, дальше — пока укладываемся в срок.
+            if step and deadline is not None and time.monotonic() >= deadline:
+                return
             try:
                 self._scroll_gesture(page, random.uniform(*SCROLL_STEP_PX))
             except Exception as error:
                 print(f"прокрутка не прошла: {error.__class__.__name__}", flush=True)
                 return
-            page.wait_for_timeout(random.uniform(*SCROLL_PAUSE_MS))
+            pause = random.uniform(*SCROLL_PAUSE_MS)
+            if deadline is not None:
+                pause = max(0.0, min(pause, (deadline - time.monotonic()) * 1000))
+            page.wait_for_timeout(pause)
 
     def _read_pause_seconds(self, answer: str) -> float:
         """Сколько «читать» предыдущий ответ перед уточняющим вопросом."""
@@ -901,11 +921,13 @@ class Browser:
         return min(max(seconds, FOLLOWUP_READ_MIN_S), FOLLOWUP_READ_MAX_S)
 
     def _read_answer(self, page, answer: str) -> None:
-        """Проводит паузу чтения, листая ответ, а не замерев на месте."""
+        """Беглый взгляд на ответ: 2–3 остановки прокрутки, не дольше FOLLOWUP_READ_MAX_S.
+
+        Одна такая фаза на ответ — сразу, как он дописан. Курсор наводится на
+        ответ один раз в начале, срок считается вместе с этим наведением.
+        """
         deadline = time.monotonic() + self._read_pause_seconds(answer)
-        while time.monotonic() < deadline:
-            self._read_scroll(page)
-            page.wait_for_timeout(random.uniform(600, 1600))
+        self._read_scroll(page, steps=random.randint(*READ_STOPS), deadline=deadline)
 
     def _take_free_page(self, context):
         # Camoufox стартует с одной пустой about:blank вкладкой. Если её
@@ -924,13 +946,30 @@ class Browser:
             self.shutdown()
             return self._take_free_page(self._ensure_browser())
 
+    @staticmethod
+    def _click_unstable(locator):
+        """Клик, который не упирается в playwright-проверку «stable».
+
+        Главная google.com периодически анимирует поле и плашку, и на такой
+        загрузке «stable» не сходится ни у одного элемента: в живом прогоне
+        подряд не дались и плашка, и поле, первый вопрос занял 69 с вместо ~35.
+        Сначала обычный клик — он заодно проверяет, что элемент не перекрыт; не
+        вышло — force=True: пропускаются только проверки actionability, событие
+        остаётся настоящим кликом мыши.
+        """
+        try:
+            locator.click(timeout=FIELD_CLICK_TIMEOUT // 2)
+        except Exception:
+            locator.click(timeout=FIELD_CLICK_TIMEOUT, force=True)
+
     def _arm_ai_mode(self, page) -> bool:
         """Клик по плашке «Режим ИИ» на главной. True — форма переключилась."""
         try:
-            page.locator(AI_MODE_CHIP).first.click(timeout=FIELD_CLICK_TIMEOUT)
+            self._click_unstable(page.locator(AI_MODE_CHIP).first)
             page.locator(AI_MODE_ARMED).wait_for(state="attached", timeout=AI_MODE_ARM_TIMEOUT)
-        except Exception:
-            print("плашка AI Mode не сработала, иду через обычную выдачу", flush=True)
+        except Exception as error:
+            reason = str(error).splitlines()[0][:80] if str(error) else type(error).__name__
+            print(f"плашка AI Mode не сработала ({reason}), иду через обычную выдачу", flush=True)
             return False
         page.wait_for_timeout(random.uniform(250, 700))  # глазом к полю
         return True
@@ -1024,10 +1063,11 @@ class Browser:
 
         previous_answers = page.locator(AI_ANSWER).count()
         previous_text = page.locator(AI_ANSWER).last.inner_text().strip() if previous_answers else ""
-        # Сначала дочитываем предыдущий ответ и только потом тянемся к полю:
-        # без этой паузы следующий вопрос начинал печататься через пару секунд
-        # после того, как Google дописал простыню.
-        self._read_answer(page, previous_text)
+        # Ответ читается один раз, сразу как дописан (get_last_ai_answer). Здесь
+        # дочитываем, только если этого не было: иначе между вопросами скрипт
+        # второй раз листал уже прочитанное.
+        if not session.answer_read:
+            self._read_answer(page, previous_text)
 
         box = page.locator(FOLLOWUP_INPUT).first
         try:
@@ -1080,6 +1120,7 @@ class Browser:
 
         # get_last_ai_answer() fills the answer after the worker receives it.
         session.transcript.append([sent_query, None])
+        session.answer_read = False
 
     def get_last_ai_answer(self, user_session_id: str, session_id: str) -> str:
         """Текст ответа AI Mode на последний вопрос этой сессии.
@@ -1097,7 +1138,6 @@ class Browser:
         deadline = time.monotonic() + STREAM_TIMEOUT
         previous = ""
         stable_since = time.monotonic()
-        next_scroll = time.monotonic() + random.uniform(1.5, 3.0)
         while time.monotonic() < deadline:
             current = answer.inner_text().strip()
             now = time.monotonic()
@@ -1119,13 +1159,12 @@ class Browser:
                 # Нумерация маркеров сквозная по блоку, поэтому список источников
                 # прошлого хода остаётся: номера в тексте должны сходиться.
                 session.sources = sources
-                self._read_scroll(page, steps=random.randint(2, 4))  # дочитать до конца
+                # Единственная фаза чтения этого ответа; перед уточнением его
+                # второй раз не листаем (см. ask_followup).
+                self._read_answer(page, text)
+                session.answer_read = True
                 return text
-            if now >= next_scroll:  # читаем по мере того, как текст пишется
-                self._read_scroll(page)
-                next_scroll = time.monotonic() + random.uniform(1.2, 2.5)
-            else:
-                page.wait_for_timeout(250)
+            page.wait_for_timeout(250)
         raise AnswerUnavailableError(
             "ответ AI Mode не завершил генерацию", self._capture_screenshot(page)
         )
