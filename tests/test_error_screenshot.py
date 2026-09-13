@@ -152,7 +152,7 @@ class DiagnosticScreenshotTest(unittest.TestCase):
         browser._take_free_page = lambda _context: page
         browser._dump_page = lambda *_args: None
 
-        def fail_open(_page, _query):
+        def fail_open(_page, _query, **_kwargs):
             raise RuntimeError("click timeout")
 
         browser._open_ai_mode = fail_open

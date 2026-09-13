@@ -23,7 +23,16 @@ def handle(browser: Browser, task: Task) -> Result:
             browser.close_session(task.user_session_id, session_id)
             return Result(session_id=session_id)
         if session_id is None:
-            session_id = browser.new_search_session(task.user_session_id, task.query)
+            session_id = browser.new_search_session(
+                task.user_session_id, task.query, task.attachments
+            )
+            pending = browser.take_pending_attachments(task.user_session_id, session_id)
+            if pending:
+                # Вложения не ушли с вопросом (плашка не сработала или главная их не
+                # приняла): дождаться ответа на вопрос и отправить их следующим
+                # сообщением той же беседы. Клиент получит ответ на это сообщение.
+                browser.get_last_ai_answer(task.user_session_id, session_id)
+                browser.ask_followup(task.user_session_id, session_id, "", pending)
         else:
             browser.ask_followup(
                 task.user_session_id, session_id, task.query, task.attachments

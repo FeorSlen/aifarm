@@ -74,20 +74,32 @@ AI_ANSWER = '[data-container-id="main-col"]'  # один такой блок н�
 # ставит его же скрипт (`d.setAttribute("data-aeie","true")`), поэтому маркер не
 # зависит от языка — сам текст внутри локализован (видели французский на проде).
 ANSWER_ERROR = '[data-aeie="true"]'
-# Вложения у поля уточнения AI Mode (снято с живой страницы 2026-09-13). «+» —
-# по иконке плюса; после клика в DOM два input[type=file]: картинки (accept из
-# одних image/*) и файлы (accept пустой, на главной — */*). Пункты меню не
-# трогаем — они на языке интерфейса; файл кладётся прямо в нужный input.
-ATTACH_BUTTON = 'button:has(path[d^="M440-440H200v-80H440V-760"])'
-# Вложение принято, когда есть его карточка (title = имя файла) и индикатор
-# загрузки внутри неё скрыт. Вживую на мелких файлах это 0.2–0.9 с.
-ATTACHED_JS = """(names) => names.every((name) => {
-    const chip = Array.from(document.querySelectorAll('[role="button"][title]'))
-        .find((node) => node.getAttribute('title') === name && node.offsetParent !== null);
-    if (!chip) return false;
-    const bar = chip.querySelector('[role="progressbar"]');
-    return !bar || bar.offsetParent === null;
-})"""
+# Вложения (снято с живой страницы 2026-09-13). «+» — по иконке плюса: у поля
+# уточнения AI Mode и у строки поиска главной это один значок разной толщины,
+# отсюда два пути. После клика в DOM два input[type=file]: картинки (accept из
+# одних image/*) и файлы (accept пустой у поля уточнения, */* на главной).
+# Пункты меню не трогаем — они на языке интерфейса; файл кладётся прямо в input.
+ATTACH_BUTTON = ('button:has(path[d^="M440-440H200v-80H440V-760"]), '
+                 'button:has(path[d^="M434.5-434.5H191.87"])')
+# Вложения приняты: у каждого файла есть карточка и загрузка закончилась.
+# Разметка у двух полей разная (обе сняты с живой страницы):
+#  - поле уточнения AI Mode: карточка [role=button][title=<имя>], внутри
+#    [role=progressbar], который скрывается после загрузки (0.2–0.9 с);
+#  - строка поиска главной после плашки: карточка [role=group][aria-label=<имя>];
+#    индикатор внутри неё не меняется, зато кнопка отправки формы заблокирована
+#    (disabled / aria-disabled), пока файлы грузятся.
+ATTACHED_JS = """(names) => {
+    const visible = (node) => !!node && node.offsetParent !== null;
+    const cardOf = (name) => Array.from(
+        document.querySelectorAll('[role="button"][title], [role="group"][aria-label]')
+    ).find((node) => visible(node)
+        && (node.getAttribute('title') === name || node.getAttribute('aria-label') === name));
+    const cards = names.map(cardOf);
+    if (cards.some((card) => !card)) return false;
+    if (cards.some((card) => visible(card.querySelector('[role="progressbar"]')))) return false;
+    const form = cards.find((card) => card.getAttribute('role') === 'group')?.closest('form');
+    return !(form && form.querySelector('button[disabled], button[aria-disabled="true"]'));
+}"""
 
 # Физические клавиши русской раскладки в английской: уточнение «Почему»
 # отправляется как «Gjxtve». Остальные символы оставляем как есть.
@@ -466,12 +478,17 @@ class SearchSession:
     transcript: list = None  # [(вопрос, ответ), ...] — для контекста follow-up
     sources: list = None     # источники последнего ответа: [{index, url, title}, ...]
     answer_read: bool = False  # последний ответ уже прочитан (прокручен) — второй раз не листаем
+    # Вложения первого вопроса, которые не ушли вместе с ним (плашка не
+    # сработала или главная их не приняла): уходят следующим сообщением.
+    pending_attachments: list = None
 
     def __post_init__(self):
         if self.transcript is None:
             self.transcript = []
         if self.sources is None:
             self.sources = []
+        if self.pending_attachments is None:
+            self.pending_attachments = []
 
 
 # Капча без редиректа на /sorry/: разметка страницы проверки. Проверяется
@@ -1003,7 +1020,7 @@ class Browser:
         page.wait_for_timeout(random.uniform(250, 700))  # глазом к полю
         return True
 
-    def _open_ai_mode(self, page, prompt: str, human_tail: str = None):
+    def _open_ai_mode(self, page, prompt: str, human_tail: str = None, attachments=()) -> list:
         """google.com → плашка «Режим ИИ» → ввод запроса → Enter → ждём ответ.
 
         Предпочтительный путь — плашка на главной: вопрос уходит сразу в AI Mode,
@@ -1012,6 +1029,12 @@ class Browser:
         вкладка страхует и случай, когда плашка сработала, а Enter всё равно
         привёл на обычную выдачу: вопрос уже отправлен, повторно его не набираем.
 
+        attachments: картинки и файлы первого вопроса. На быстром пути они
+        прикрепляются на главной сразу после плашки и уходят с вопросом одним
+        сообщением. Если плашка не сработала или главная их не приняла, вопрос
+        уходит без них. Возвращает вложения, которые не ушли: их отправляют
+        следующим сообщением, когда AI Mode ответит на вопрос.
+
         human_tail: если задан — prompt вставляется целиком (fill), а human_tail
         допечатывается по-человечески в конце (для длинного контекста + короткого
         живого вопроса). Если не задан — хвост отрезается автоматически, см.
@@ -1019,7 +1042,18 @@ class Browser:
         """
         page.goto(GOOGLE_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
         self._accept_cookies(page)
-        self._arm_ai_mode(page)
+        pending = list(attachments)
+        if self._arm_ai_mode(page) and pending:
+            try:
+                self._attach(page, pending)
+                pending = []
+            except AttachmentError as error:
+                # Часть файлов могла прикрепиться — начисто открываем главную,
+                # чтобы ни один не ушёл дважды.
+                print(f"вложения на главной не прикрепились ({error}); "
+                      "отправлю их после первого ответа", flush=True)
+                page.goto(GOOGLE_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+                self._arm_ai_mode(page)
 
         box = page.locator(SEARCH_BOX)
         if human_tail is None:
@@ -1056,16 +1090,21 @@ class Browser:
             raise AnswerUnavailableError(
                 "контейнер ответа AI Mode не появился", self._capture_screenshot(page)
             ) from error
+        return pending
 
-    def new_search_session(self, user_session_id: str, query: str) -> str:
-        """Открывает вкладку, ищет query, переходит в AI Mode. Возвращает session_id."""
+    def new_search_session(self, user_session_id: str, query: str, attachments=()) -> str:
+        """Открывает вкладку, ищет query, переходит в AI Mode. Возвращает session_id.
+
+        Вложения, которые не ушли вместе с вопросом, ждут в сессии — см.
+        take_pending_attachments.
+        """
         self._expire_sessions()
         self._rotate_by_load()
         self._profile_budget -= 1
         page = self._take_search_page()
         page.bring_to_front()
         try:
-            self._open_ai_mode(page, query)
+            pending = self._open_ai_mode(page, query, attachments=attachments)
         except AnswerUnavailableError:
             raise
         except Exception as error:
@@ -1080,6 +1119,7 @@ class Browser:
         session_id = uuid.uuid4().hex[:8]
         session = SearchSession(page, user_session_id, datetime.now(UTC))
         session.transcript.append([query, None])  # ответ допишет get_last_ai_answer
+        session.pending_attachments = list(pending or [])
         self._sessions[session_id] = session
         return self._public_session_id(session_id)
 
@@ -1260,6 +1300,12 @@ class Browser:
         if os.getenv("AIFARM_DUMP_ANSWER"):
             self._dump_answer(answer, raw, cleaned)
         return cleaned, _valid_sources(parsed.get("sources"))
+
+    def take_pending_attachments(self, user_session_id: str, session_id: str) -> list:
+        """Забирает вложения первого вопроса, которые не ушли вместе с ним."""
+        session = self._session(user_session_id, session_id)
+        pending, session.pending_attachments = session.pending_attachments, []
+        return pending
 
     def last_sources(self, user_session_id: str, session_id: str) -> list[dict]:
         """Источники последнего ответа этой сессии (пусто, пока ответа нет)."""

@@ -51,8 +51,8 @@ INSTRUCTIONS = (
     f"беседу коротким вопросом по сути, а развёрнутый текст (до {FOLLOWUP_QUERY_MAX_CHARS} "
     "символов) пришлите вторым вызовом search с полученным tab_id — он уходит уже "
     "в поле AI Mode. "
-    "Картинки и файлы — только в активную беседу: загрузите их через POST /files "
-    "шлюза (ответ — file_id) и передайте file_ids вместе с tab_id."
+    "Картинки и файлы загружайте через POST /files шлюза (ответ — file_id) и "
+    "передавайте file_ids в search: и вместе с первым вопросом беседы, и в продолжение."
 )
 
 mcp = MCPServer("aifarm", instructions=INSTRUCTIONS)
@@ -137,14 +137,15 @@ def resolve_user(raw: str | None) -> str:
 
 
 def _check_message(question: str, tab_id: str | None, file_ids: list[str]) -> None:
-    """Сообщение — текст, вложения или и то и другое; вложения только в беседу."""
-    if file_ids and not tab_id:
-        raise ToolError(
-            "Вложения отправляются только в активную беседу. Начните беседу вопросом "
-            "без вложений, затем повторите search с полученным tab_id и file_ids."
-        )
-    if not question.strip() and not file_ids:
+    """Сообщение — текст, вложения или и то и другое; новая беседа — с текстом."""
+    if question.strip():
+        return
+    if not file_ids:
         raise ToolError("Вопрос не может быть пустым")
+    if not tab_id:
+        raise ToolError(
+            "Новая беседа начинается с текста вопроса; картинки и файлы приложите к нему же."
+        )
 
 
 def _user(ctx: Context) -> str:
@@ -174,7 +175,7 @@ async def search(
             max_length=FOLLOWUP_QUERY_MAX_CHARS,
             description=(
                 "Короткий естественный вопрос на английском языке; один вызов — один "
-                "вопрос. Пустым может быть только вместе с file_ids. Без tab_id "
+                "вопрос. Пустым может быть только в продолжении беседы (с tab_id) и при file_ids. Без tab_id "
                 f"(первый вопрос беседы) — максимум {FIRST_QUERY_MAX_CHARS} символов, "
                 f"с tab_id — до {FOLLOWUP_QUERY_MAX_CHARS}."
             ),
@@ -197,8 +198,8 @@ async def search(
             description=(
                 "Вложения сообщения: file_id картинок и файлов, заранее загруженных в "
                 "шлюз (POST /files, multipart-поле file, тот же заголовок X-Aifarm-User). "
-                "Только вместе с tab_id: в новую беседу вложения не отправляются. "
-                f"Не больше {uploads.MAX_ATTACHMENTS}. С вложениями question может быть пустым."
+                "Можно и в новую беседу (вместе с вопросом), и в продолжение (с tab_id; "
+                f"тогда question может быть пустым). Не больше {uploads.MAX_ATTACHMENTS}."
             ),
         ),
     ] = None,
@@ -216,8 +217,8 @@ async def search(
     Длинное задание отправляйте в два хода: короткий первый вопрос, затем
     развёрнутый текст вторым вызовом с полученным tab_id.
 
-    Картинки и файлы — только в активную беседу: загрузите их через POST /files
-    (ответ — file_id) и передайте file_ids вместе с tab_id.
+    Картинки и файлы: загрузите через POST /files (ответ — file_id) и передайте
+    file_ids — вместе с первым вопросом беседы или в продолжение по tab_id.
     """
     file_ids = file_ids or []
     _check_message(question, tab_id, file_ids)

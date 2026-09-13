@@ -20,7 +20,17 @@ from src.api import uploads
 from src.api.mcp import _check_message
 from src.api.service import Gateway, Job
 from src.contract import Attachment, Result, Task
-from src.worker.browser import AI_ANSWER, ANSWER_ERROR, FOLLOWUP_INPUT, Browser, _is_image_accept
+from src.worker.browser import (
+    AI_ANSWER,
+    AI_MODE_LINK,
+    ANSWER_ERROR,
+    FOLLOWUP_INPUT,
+    SEARCH_BOX,
+    AttachmentError,
+    Browser,
+    _is_image_accept,
+)
+from src.worker.worker import handle
 
 IMAGE = Attachment(path="/tmp/x/cat.png", name="cat.png", kind="image")
 FILE_ID = "a" * 32
@@ -46,9 +56,12 @@ class MessageContractTest(unittest.TestCase):
     def test_text_and_attachments_together_are_valid(self):
         Task(user_session_id="u", session_id="w:t", query="what is this", attachments=[IMAGE])
 
-    def test_attachments_are_not_allowed_into_a_new_conversation(self):
+    def test_new_conversation_may_carry_attachments_with_its_question(self):
+        Task(user_session_id="u", query="what is this", attachments=[IMAGE])
+
+    def test_new_conversation_starts_with_text(self):
         with self.assertRaises(ValidationError):
-            Task(user_session_id="u", query="what is this", attachments=[IMAGE])
+            Task(user_session_id="u", query="", attachments=[IMAGE])
 
     def test_message_needs_text_or_attachments(self):
         with self.assertRaises(ValidationError):
@@ -62,9 +75,10 @@ class MessageContractTest(unittest.TestCase):
 
 
 class McpMessageCheckTest(unittest.TestCase):
-    def test_attachments_without_tab_are_rejected(self):
+    def test_new_conversation_takes_attachments_with_a_question(self):
+        _check_message("what is this", None, [FILE_ID])
         with self.assertRaises(ToolError):
-            _check_message("what is this", None, [FILE_ID])
+            _check_message("", None, [FILE_ID])
 
     def test_empty_question_is_allowed_only_with_attachments(self):
         with self.assertRaises(ToolError):
@@ -175,6 +189,95 @@ class AttachInFollowupTest(unittest.TestCase):
         self.assertEqual(steps, [("type", "and why"), ("press", "Enter")])
 
 
+class FirstQuestionAttachmentsTest(unittest.TestCase):
+    """Первый вопрос с вложениями: быстрый путь через плашку и запасной."""
+
+    def open_ai_mode(self, armed, attach_error=None):
+        browser = Browser.__new__(Browser)
+        browser._accept_cookies = lambda _page: None
+        steps = []
+        browser._arm_ai_mode = lambda _page: steps.append("arm") or armed
+
+        def attach(_page, items):
+            steps.append(("attach", [item.name for item in items]))
+            if attach_error:
+                raise attach_error
+
+        browser._attach = attach
+        browser._type_query = lambda _page, _box, text: steps.append(("type", text))
+        page = MagicMock()
+        page.url = "https://www.google.com/"
+        box = MagicMock()
+        box.press.side_effect = lambda _key: setattr(
+            page, "url", "https://www.google.com/search?q=x&udm=50"
+        )
+        page.locator.side_effect = lambda selector: {
+            SEARCH_BOX: box, AI_ANSWER: MagicMock(), AI_MODE_LINK: MagicMock(),
+        }[selector]
+        pending = browser._open_ai_mode(page, "what is this", attachments=[IMAGE])
+        return steps, pending, page
+
+    def test_chip_path_sends_attachments_together_with_the_question(self):
+        steps, pending, _ = self.open_ai_mode(armed=True)
+
+        self.assertEqual(steps, ["arm", ("attach", ["cat.png"]), ("type", "what is this")])
+        self.assertEqual(pending, [])
+
+    def test_without_chip_attachments_wait_for_the_first_answer(self):
+        steps, pending, _ = self.open_ai_mode(armed=False)
+
+        self.assertEqual(steps, ["arm", ("type", "what is this")])
+        self.assertEqual(pending, [IMAGE])
+
+    def test_rejected_attachments_restart_from_a_clean_homepage(self):
+        steps, pending, page = self.open_ai_mode(armed=True, attach_error=AttachmentError("нет «+»"))
+
+        self.assertEqual(steps, ["arm", ("attach", ["cat.png"]), "arm", ("type", "what is this")])
+        self.assertEqual(pending, [IMAGE])
+        self.assertEqual(page.goto.call_count, 2)  # ни один файл не уйдёт дважды
+
+    def handle_new(self, pending):
+        calls = []
+
+        class BrowserStub:
+            def new_search_session(self, _user, query, attachments):
+                calls.append(("new", query, [item.name for item in attachments]))
+                return "w:t"
+
+            def take_pending_attachments(self, _user, _session):
+                return pending
+
+            def get_last_ai_answer(self, _user, _session):
+                calls.append(("answer",))
+                return "ответ"
+
+            def ask_followup(self, _user, _session, query, attachments=()):
+                calls.append(("followup", query, [item.name for item in attachments]))
+
+            def last_sources(self, _user, _session):
+                return []
+
+        result = handle(BrowserStub(), Task(user_session_id="u", query="what is this", attachments=[IMAGE]))
+        return calls, result
+
+    def test_worker_needs_no_second_message_when_attachments_went_with_the_question(self):
+        calls, result = self.handle_new(pending=[])
+
+        self.assertEqual(calls, [("new", "what is this", ["cat.png"]), ("answer",)])
+        self.assertEqual(result.session_id, "w:t")
+
+    def test_worker_fallback_sends_attachments_after_the_first_answer(self):
+        calls, result = self.handle_new(pending=[IMAGE])
+
+        self.assertEqual(calls, [
+            ("new", "what is this", ["cat.png"]),
+            ("answer",),                          # дождались ответа на вопрос
+            ("followup", "", ["cat.png"]),        # вложения следующим сообщением
+            ("answer",),                          # клиенту — ответ на вложения
+        ])
+        self.assertEqual(result.session_id, "w:t")
+
+
 class AttachmentFailureMappingTest(unittest.TestCase):
     def test_attachment_failure_keeps_its_code_and_screenshot(self):
         gateway = Gateway()
@@ -189,3 +292,72 @@ class AttachmentFailureMappingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AttachedReadinessTest(unittest.TestCase):
+    """ATTACHED_JS на настоящем движке: фикстуры повторяют снятую разметку обоих полей."""
+
+    HOMEPAGE = """
+    <form action="/search"><textarea name="q"></textarea>
+      <div role="list">
+        <div class="f1YNu" role="group" aria-label="cat.png">
+          <button aria-label="cat.png" type="button"><img alt="">
+            <div log="SearchboxMultimodalLoadingIcon; track:ved"></div></button></div>
+        <div class="f1YNu" role="group" aria-label="recipe.txt">
+          <button aria-label="recipe.txt" type="button">
+            <div log="SearchboxMultimodalLoadingIcon; track:ved"></div></button></div>
+      </div>
+      <button aria-haspopup="menu" type="button">+</button>
+      <button type="submit" {submit}>AI Mode</button>
+    </form>"""
+
+    CHAT = """
+    <div><textarea class="ITIRGe"></textarea>
+      <div role="button" title="cat.png" aria-label="cat.png">
+        <div role="progressbar" style="{bar}">…</div></div>
+      <button data-xid="input-plate-send-button">send</button>
+    </div>"""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as error:  # pragma: no cover - зависит от окружения
+            raise unittest.SkipTest(f"playwright недоступен: {error}") from error
+        from src.worker.browser import ATTACHED_JS
+        cls.js = ATTACHED_JS
+        cls._pw = sync_playwright().start()
+        try:
+            cls._browser = cls._pw.chromium.launch(args=["--no-sandbox"])
+        except Exception as error:  # pragma: no cover - браузер не установлен
+            cls._pw.stop()
+            raise unittest.SkipTest(f"chromium недоступен: {error}") from error
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._browser.close()
+        cls._pw.stop()
+
+    def ready(self, html, names):
+        page = self._browser.new_page()
+        try:
+            page.set_content(html)
+            return page.evaluate(self.js, names)
+        finally:
+            page.close()
+
+    def test_homepage_waits_while_the_submit_button_is_blocked(self):
+        self.assertFalse(self.ready(self.HOMEPAGE.replace("{submit}", 'disabled aria-disabled="true"'),
+                                    ["cat.png", "recipe.txt"]))
+
+    def test_homepage_is_ready_when_the_submit_button_unblocks(self):
+        self.assertTrue(self.ready(self.HOMEPAGE.replace("{submit}", ""), ["cat.png", "recipe.txt"]))
+
+    def test_missing_card_is_not_ready(self):
+        self.assertFalse(self.ready(self.HOMEPAGE.replace("{submit}", ""), ["cat.png", "other.pdf"]))
+
+    def test_chat_waits_for_the_progressbar(self):
+        self.assertFalse(self.ready(self.CHAT.replace("{bar}", ""), ["cat.png"]))
+
+    def test_chat_is_ready_when_the_progressbar_hides(self):
+        self.assertTrue(self.ready(self.CHAT.replace("{bar}", "display:none"), ["cat.png"]))

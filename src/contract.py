@@ -16,7 +16,9 @@ class Task(BaseModel):
     user_session_id: str = Field(min_length=1)
     session_id: str | None = None
     # None — управляющая задача (список или закрытие вкладок). Сообщение — это
-    # текст, вложения или и то и другое: при вложениях текст может быть пустым.
+    # текст, вложения или и то и другое. Новая беседа начинается с текста:
+    # запасной путь входа в AI Mode идёт через строку поиска, без текста там
+    # нечего отправить. В продолжении беседы текст при вложениях необязателен.
     query: str | None = Field(default=None, max_length=10_000)
     attachments: list[Attachment] = Field(default_factory=list)
 
@@ -26,10 +28,12 @@ class Task(BaseModel):
             if self.attachments:
                 raise ValueError("attachments need a message, not a control task")
             return self
-        if not self.query.strip() and not self.attachments:
+        if self.query.strip():
+            return self
+        if self.session_id is None:
+            raise ValueError("a new conversation starts with text")
+        if not self.attachments:
             raise ValueError("message needs text or attachments")
-        if self.attachments and self.session_id is None:
-            raise ValueError("attachments are sent only into an active session")
         return self
 
 
