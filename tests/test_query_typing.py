@@ -59,8 +59,11 @@ class FakeLocator:
         self.filled = None
         self.clicks = 0
 
-    def click(self):
+    def click(self, timeout=None):
         self.clicks += 1
+
+    def focus(self):
+        self.focused = True
 
     def fill(self, text):
         self.filled = text

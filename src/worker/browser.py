@@ -5,6 +5,7 @@
     session_id = br.new_search_session(user_session_id, query) -> str
     br.ask_followup(user_session_id, session_id, query)
     text = br.get_last_ai_answer(user_session_id, session_id)
+    sources = br.last_sources(user_session_id, session_id)
 
 Один Browser = один живой браузер/профиль/куки на всё время жизни текущей
 "личности". Личность — это каталог профиля на диске (куки + постоянное
@@ -115,6 +116,13 @@ STREAM_TIMEOUT = int(os.getenv("STREAM_TIMEOUT_S", "45"))  # стриминг о
 # тот про элементы, которые уже есть в DOM, а здесь Google сперва думает над
 # вопросом и только потом создаёт контейнер — на длинном вопросе 20 с не хватает.
 ANSWER_START_TIMEOUT = int(os.getenv("ANSWER_START_TIMEOUT_S", "60")) * 1000
+# Проба «перекрыто ли поле поиска диалогом согласия». Это не ожидание элемента,
+# а вопрос к уже загруженной странице, поэтому потолок свой и небольшой.
+CONSENT_PROBE_TIMEOUT = int(os.getenv("CONSENT_PROBE_TIMEOUT_MS", "8000"))
+# Потолок на клик по полю ввода. Меньше EL_TIMEOUT намеренно: клик по полю —
+# не ожидание элемента, а необязательный жест, у которого есть замена (см.
+# _focus_field). Выстаивать за него 20 с и валить сессию нельзя.
+FIELD_CLICK_TIMEOUT = int(os.getenv("FIELD_CLICK_TIMEOUT_MS", "6000"))
 
 # Сколько последних символов запроса допечатываются посимвольно. Остальное
 # вставляется одним fill(): посимвольный ввод всей простыни — это по XHR в
@@ -160,7 +168,27 @@ def _flag(name, default=True):
 
 
 # --- переключатели поведения (env, без ребилда; см. README) ---
-FLAG_HUMANIZE = _flag("AIFARM_HUMANIZE")              # человекоподобные движения курсора Camoufox
+# Человекоподобное движение курсора Camoufox. Потолок обязателен: при
+# humanize=true без него курсор ведётся к цели «сколько понадобится», и мы
+# своими глазами видели, как он ходит из стороны в сторону мимо строки поиска и
+# не доходит вовсе. Цена этого — не косметика: Locator.click выстаивает весь
+# таймаут и роняет сессию ("AI Mode не открылся"), а у page.mouse.move таймаута
+# нет вообще, и воркер вставал на десятки минут. Camoufox принимает числом
+# максимум секунд на одно движение — этого достаточно, поведение остаётся живым.
+# AIFARM_HUMANIZE: false/0 — выключить совсем, число — свой потолок в секундах.
+HUMANIZE_MAX_SECONDS = 1.5
+
+
+def _humanize_setting():
+    raw = os.getenv("AIFARM_HUMANIZE", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("", "1", "true", "yes", "on"):
+        return HUMANIZE_MAX_SECONDS
+    return float(raw)
+
+
+FLAG_HUMANIZE = _humanize_setting()                   # человекоподобные движения курсора Camoufox
 FLAG_GEOIP = _flag("AIFARM_GEOIP")                    # подгонка TZ/локали под exit-IP прокси
 FLAG_BLOCK_WEBRTC = _flag("AIFARM_BLOCK_WEBRTC")      # блок утечки реального IP через WebRTC
 FLAG_ACCEPT_CONSENT = _flag("AIFARM_ACCEPT_CONSENT")  # авто-принятие диалога согласия Google
@@ -168,24 +196,106 @@ FLAG_DENOISE = _flag("AIFARM_DENOISE")                # чистка ответ�
 FLAG_SEED_COOKIES = _flag("AIFARM_SEED_COOKIES")      # инъекция куков (файл + дефолтное согласие)
 FLAG_READ_SCROLL = _flag("AIFARM_READ_SCROLL")        # прокрутка ответа во время чтения
 
-# Денойз ответа AI Mode: убираем с клона ноды UI-обвязку. Список консервативный
-# и структурный (роли/теги, не классы Google — те гниют за недели). ВНИМАНИЕ:
-# 'sup' под вопросом — Google может рендерить в нём степени/сноски; проверить на
-# дампе (AIFARM_DUMP_ANSWER) и при необходимости сузить до 'sup:has(a)'.
-_DENOISE_JS = """
-(el) => {
+# Разбор ответа AI Mode на клоне ноды: сперва сноски, потом чистка от UI.
+#
+# Живой DOM трогать нельзя — на нём висит счётчик ходов ask_followup и скрипты
+# Google. Кликов здесь нет намеренно: источники Google уже отрендерил ссылками
+# внутри ответа, а лишние клики по чужому UI — это трафик на самом опасном для
+# профиля пути. Если ссылок в ответе не оказалось, отдаём только текст, как раньше.
+#
+# Порядок обязателен: сноска сначала превращается в текстовый маркер [n] рядом с
+# чипом и только потом чип выкидывается стрипом. Раньше стрип уносил 'sup'
+# вместе со ссылкой, поэтому в ответе не оставалось ни одного источника.
+#
+# Список стрипа консервативный и структурный (роли/теги, не классы Google — те
+# гниют за недели).
+_ANSWER_JS = """
+(el, options) => {
   const clone = el.cloneNode(true);
-  clone.querySelectorAll(
-    'button, [role="button"], [role="menu"], [role="menuitem"], [role="dialog"],'
-    + ' [role="listbox"], [role="tablist"], [role="navigation"], svg, script, style,'
-    + ' [aria-hidden="true"], sup'
-  ).forEach((n) => n.remove());
+  const sources = [];
+  const seen = new Map();
+
+  // Адрес источника. Сноски AI Mode ведут на /goto?url=<непрозрачный токен>:
+  // настоящего адреса в DOM нет нигде (проверено дампом живой страницы), но
+  // ссылка публично редиректит на источник и без куков — поэтому отдаём её как
+  // есть, а не выбрасываем вместе с остальными ссылками Google. Классический
+  // /url?q=<цель> разворачиваем. Прочие ссылки Google — навигация по выдаче.
+  const target = (href, depth) => {
+    let url;
+    try {
+      url = new URL(href, location.href);
+    } catch (error) {
+      return null;
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    if (/(^|\\.)google(\\.[a-z]{2,3})+$/.test(url.hostname)) {
+      if (url.pathname === '/goto' && url.searchParams.get('url')) {
+        url.hash = '';
+        return url.href;
+      }
+      const inner = url.searchParams.get('q') || url.searchParams.get('url');
+      return inner && depth < 3 ? target(inner, depth + 1) : null;
+    }
+    url.hash = '';
+    return url.href;
+  };
+
+  for (const anchor of clone.querySelectorAll('a[href]')) {
+    const url = target(anchor.getAttribute('href'), 0);
+    if (!url) continue;
+    let index = seen.get(url);
+    if (index === undefined) {
+      index = sources.length + 1;
+      seen.set(url, index);
+      sources.push({index: index, url: url, title: ''});
+    }
+    // Клон открепён от документа, поэтому только textContent: innerText на
+    // открепённой ноде пуст. У сноски AI Mode текста нет вовсе, название
+    // источника лежит в aria-label ("Python.org (+1) – Welcome to Python.org").
+    const text = (anchor.textContent || '').trim();
+    const label = text || (anchor.getAttribute('aria-label') || '').trim();
+    const numeric = /^\\[?\\d+\\]?$/.test(label);
+    if (!sources[index - 1].title && label && !numeric) {
+      sources[index - 1].title = label.slice(0, 200);
+    }
+    // Пустой чип сноски и номерной sup уносим — текста в них нет. А вот чип с
+    // текстом разворачиваем в этот самый текст: в AI Mode ссылками обёрнуты
+    // сущности внутри предложения ("Tadej Pogačar" в кнопке-чипе), и стрип
+    // кнопок вырезал их из ответа вместе с разметкой.
+    const chip = anchor.closest('sup, button, [role="button"]');
+    const node = chip || anchor;
+    if (!node.parentNode) continue;
+    node.parentNode.insertBefore(document.createTextNode(' [' + index + ']'), node.nextSibling);
+    if (!text || (chip && numeric)) {
+      node.remove();
+    } else if (chip) {
+      chip.replaceWith(document.createTextNode(text));
+    }
+  }
+
+  for (const entry of sources) {
+    if (entry.title) continue;
+    try {
+      entry.title = new URL(entry.url).hostname.replace(/^www\\./, '');
+    } catch (error) {
+      entry.title = '';
+    }
+  }
+
+  if (options.denoise) {
+    clone.querySelectorAll(
+      'button, [role="button"], [role="menu"], [role="menuitem"], [role="dialog"],'
+      + ' [role="listbox"], [role="tablist"], [role="navigation"], svg, script, style,'
+      + ' [aria-hidden="true"], sup'
+    ).forEach((n) => n.remove());
+  }
+
   clone.style.position = 'fixed';
   clone.style.left = '-99999px';
   clone.style.top = '0';
   document.body.appendChild(clone);
   try {
-    return clone.innerText;
+    return {text: clone.innerText, sources: sources};
   } finally {
     clone.remove();
   }
@@ -206,6 +316,29 @@ def _clean_text(text: str) -> str:
             continue
         out.append(line)
     return "\n".join(out).strip()
+
+
+def _valid_sources(raw) -> list[dict]:
+    """Отсеивает мусор из того, что вернула страница. Чистая функция.
+
+    Всё, что приходит из браузера, — данные с чужой страницы: проверяем тип и
+    схему каждого элемента, а не полагаемся на форму объекта из _ANSWER_JS.
+    """
+    sources: list[dict] = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        index, url, title = item.get("index"), item.get("url"), item.get("title")
+        if not isinstance(index, int) or index < 1:
+            continue
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            continue
+        sources.append({
+            "index": index,
+            "url": url,
+            "title": title.strip()[:200] if isinstance(title, str) else "",
+        })
+    return sources
 
 
 def _followup_key_layout(text: str) -> str:
@@ -279,15 +412,33 @@ class SearchSession:
     user_session_id: str
     created_at: datetime
     transcript: list = None  # [(вопрос, ответ), ...] — для контекста follow-up
+    sources: list = None     # источники последнего ответа: [{index, url, title}, ...]
 
     def __post_init__(self):
         if self.transcript is None:
             self.transcript = []
+        if self.sources is None:
+            self.sources = []
 
 
-def _check_blocked(page):
+# Капча без редиректа на /sorry/: разметка страницы проверки. Проверяется
+# только там, где шаг уже провалился, — иначе это лишний round-trip на каждую
+# навигацию. Разница осмысленная: с этой проверкой профиль уходит в ротацию,
+# без неё тот же случай возвращался клиенту как невнятный таймаут.
+CAPTCHA_DOM = 'form#captcha-form, iframe[src*="/recaptcha/"], div.g-recaptcha'
+
+
+def _check_blocked(page, deep: bool = False):
     if "/sorry/" in page.url:
         raise BlockedError(f"заблокировано Google: {page.url}")
+    if not deep:
+        return
+    try:
+        found = page.locator(CAPTCHA_DOM).count() > 0
+    except Exception:
+        return  # страница уже недоступна — пусть падает исходная ошибка
+    if found:
+        raise BlockedError(f"капча на странице: {page.url}")
 
 
 def _load_cookie_file():
@@ -593,7 +744,11 @@ class Browser:
             return
         for attempt in range(4):
             try:  # поле поиска доступно и не перекрыто — диалога нет
-                page.locator(SEARCH_BOX).first.click(trial=True, timeout=2500)
+                # Замер: ПЕРВАЯ проверка actionability после навигации стоит
+                # ~1.9 с (дальше 0.04 с), а прежний потолок был 2500 мс — запаса
+                # 600 мс. Не уложившись, код решал, что поле перекрыто диалогом,
+                # и уходил искать несуществующую кнопку согласия по всем фреймам.
+                page.locator(SEARCH_BOX).first.click(trial=True, timeout=CONSENT_PROBE_TIMEOUT)
                 return
             except Exception:
                 pass
@@ -631,10 +786,31 @@ class Browser:
             delay += random.uniform(300, 900)  # действительно задумался
         return delay
 
+    def _focus_field(self, page, locator):
+        """Ставит курсор в поле ввода. Клик — как человек, но не любой ценой.
+
+        Строка поиска google.com периодически не проходит проверку playwright
+        «stable»: та ждёт одинакового bounding box на двух подряд кадрах, а поле
+        в этот момент анимируется. Замер: первая проверка после навигации стоит
+        ~1.9 с, дальше 0.04 с, но в этом состоянии она не сходится вовсе — клик
+        выстаивал весь таймаут и ронял всю сессию ("AI Mode не открылся"), хотя
+        страница живая и поле на месте (rAF 60 fps, elementFromPoint попадает в
+        саму textarea). Причина в самой анимации Google, снаружи она не чинится.
+
+        Поле на google.com и так autofocus — человек, открывший страницу, просто
+        печатает. Поэтому промах клика не повод валить поиск: ставим фокус.
+        """
+        try:
+            locator.click(timeout=FIELD_CLICK_TIMEOUT)
+        except Exception:
+            print("поле не далось клику (playwright: not stable), ставлю фокус напрямую",
+                  flush=True)
+            locator.focus()
+        page.wait_for_timeout(random.uniform(150, 400))  # прицелиться перед вводом
+
     def _human_type(self, page, locator, text, focus=True):
         if focus:
-            locator.click()
-            page.wait_for_timeout(random.uniform(150, 400))  # прицелиться перед вводом
+            self._focus_field(page, locator)
         for ch in text:
             page.keyboard.type(ch)
             page.wait_for_timeout(self._key_delay(ch))
@@ -646,7 +822,7 @@ class Browser:
             self._human_type(page, locator, text, focus=focus)
             return
         if focus:
-            locator.click()
+            self._focus_field(page, locator)
         locator.fill(head)
         page.wait_for_timeout(random.uniform(200, 500))  # перечитать вставленное
         page.keyboard.press("End")
@@ -773,7 +949,7 @@ class Browser:
             page.locator(AI_ANSWER).last.wait_for(state="visible", timeout=EL_TIMEOUT)
         except Exception as error:
             self._dump_page(page, "answer_missing")
-            _check_blocked(page)
+            _check_blocked(page, deep=True)
             raise AnswerUnavailableError(
                 "контейнер ответа AI Mode не появился", self._capture_screenshot(page)
             ) from error
@@ -791,7 +967,9 @@ class Browser:
             raise
         except Exception as error:
             self._dump_page(page, "fail")
-            _check_blocked(page)  # /sorry/ мог прилететь редиректом уже после проверки
+            # /sorry/ мог прилететь редиректом уже после проверки, а капчу
+            # Google иногда показывает прямо на выдаче, без редиректа.
+            _check_blocked(page, deep=True)
             raise AnswerUnavailableError(
                 "AI Mode не открылся", self._capture_screenshot(page)
             ) from error
@@ -821,7 +999,7 @@ class Browser:
             box.wait_for(state="visible", timeout=EL_TIMEOUT)
         except Exception as error:
             self._dump_page(page, "followup_input_missing")
-            _check_blocked(page)
+            _check_blocked(page, deep=True)
             raise AnswerUnavailableError(
                 "поле уточняющего вопроса AI Mode не найдено",
                 self._capture_screenshot(page),
@@ -853,7 +1031,7 @@ class Browser:
             # понять, ушёл ли вопрос вообще и что показывает страница, иначе
             # можно только гадать по таймауту.
             self._dump_page(page, "followup_fail")
-            _check_blocked(page)
+            _check_blocked(page, deep=True)
             raise AnswerUnavailableError(
                 "ответ на уточняющий вопрос не появился", self._capture_screenshot(page)
             ) from None
@@ -894,7 +1072,7 @@ class Browser:
             elif current and now - stable_since >= 1.5:
                 if os.getenv("AIFARM_DUMP_ANSWER"):
                     self._dump_page(page, "ok")
-                text = self._denoise(answer, current)
+                text, sources = self._answer_parts(answer, current)
                 # Если ответ дописался в тот же блок, в тексте лежит и прошлый
                 # ход диалога — отдавать его повторно нельзя.
                 if len(session.transcript) >= 2:
@@ -903,6 +1081,9 @@ class Browser:
                         text = text[len(earlier):].lstrip()
                 if session.transcript and session.transcript[-1][1] is None:
                     session.transcript[-1][1] = text  # для контекста будущих follow-up
+                # Нумерация маркеров сквозная по блоку, поэтому список источников
+                # прошлого хода остаётся: номера в тексте должны сходиться.
+                session.sources = sources
                 self._read_scroll(page, steps=random.randint(2, 4))  # дочитать до конца
                 return text
             if now >= next_scroll:  # читаем по мере того, как текст пишется
@@ -914,24 +1095,27 @@ class Browser:
             "ответ AI Mode не завершил генерацию", self._capture_screenshot(page)
         )
 
-    def _denoise(self, answer, raw: str) -> str:
-        """Чистит ответ AI Mode от UI-обвязки (кнопки-цитаты, иконки, сноски).
+    def _answer_parts(self, answer, raw: str) -> tuple[str, list[dict]]:
+        """Текст ответа (с маркерами [n]) и источники под этими маркерами.
 
-        Стрип структурный: на клоне ноды (живой DOM трогать нельзя — на нём
-        висит счётчик ходов ask_followup и JS Google) выкидываются заведомо
-        не-текстовые элементы, затем читается innerText. Если стрип срезал
-        всё — отдаём сырой текст, пустоту не возвращаем никогда.
+        Разбор целиком в браузере (_ANSWER_JS) — один вызов на ответ. Если он
+        не удался или разметка Google поехала, остаётся сырой текст без
+        источников: поиск от этого не падает. Пустоту не возвращаем никогда.
         """
-        if not FLAG_DENOISE:
-            return _clean_text(raw)
         try:
-            stripped = answer.evaluate(_DENOISE_JS)
+            parsed = answer.evaluate(_ANSWER_JS, {"denoise": FLAG_DENOISE})
         except Exception:
-            stripped = raw
-        cleaned = _clean_text(stripped) or _clean_text(raw)
+            parsed = None
+        if not isinstance(parsed, dict):
+            parsed = {}
+        cleaned = _clean_text(parsed.get("text") or "") or _clean_text(raw)
         if os.getenv("AIFARM_DUMP_ANSWER"):
             self._dump_answer(answer, raw, cleaned)
-        return cleaned
+        return cleaned, _valid_sources(parsed.get("sources"))
+
+    def last_sources(self, user_session_id: str, session_id: str) -> list[dict]:
+        """Источники последнего ответа этой сессии (пусто, пока ответа нет)."""
+        return list(self._session(user_session_id, session_id).sources)
 
     @staticmethod
     def _capture_screenshot(page) -> str | None:

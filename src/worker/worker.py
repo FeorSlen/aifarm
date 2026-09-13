@@ -26,9 +26,13 @@ def handle(browser: Browser, task: Task) -> Result:
             session_id = browser.new_search_session(task.user_session_id, task.query)
         else:
             browser.ask_followup(task.user_session_id, session_id, task.query)
+        # Порядок важен: источники собираются во время разбора ответа, поэтому
+        # last_sources() имеет смысл только после get_last_ai_answer().
+        answer = browser.get_last_ai_answer(task.user_session_id, session_id)
         return Result(
             session_id=session_id,
-            answer=browser.get_last_ai_answer(task.user_session_id, session_id),
+            answer=answer,
+            sources=browser.last_sources(task.user_session_id, session_id),
         )
     except BlockedError as error:
         log.warning("blocked: %s", error)

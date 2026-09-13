@@ -41,6 +41,7 @@ class Job:
     tab_id: str | None
     status: str = "pending"
     answer: str | None = None
+    sources: list[dict] = field(default_factory=list)
     error: dict | None = None
     screenshot: str | None = None
     closed_tab_ids: list[str] = field(default_factory=list)
@@ -127,7 +128,12 @@ class Gateway:
         if job.status == "pending":
             return {"status": "pending"}
         if job.status == "done":
-            return {"status": "done", "tab_id": job.tab_id, "answer": job.answer}
+            return {
+                "status": "done",
+                "tab_id": job.tab_id,
+                "answer": job.answer,
+                "sources": job.sources,
+            }
         if job.status == "blocked":
             return {
                 "status": "blocked",
@@ -197,6 +203,7 @@ class Gateway:
             job.status = "done"
             job.tab_id = result.session_id
             job.answer = result.answer
+            job.sources = [source.model_dump() for source in result.sources or []]
         job.done.set()
 
     async def _call(self, task: Task) -> Result:

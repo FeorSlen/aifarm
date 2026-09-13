@@ -10,10 +10,19 @@ class Task(BaseModel):
     query: str | None = Field(default=None, min_length=1, max_length=10_000)
 
 
+class Source(BaseModel):
+    """Источник ответа AI Mode; index — номер маркера [n] в тексте ответа."""
+
+    index: int = Field(ge=1)
+    url: str = Field(min_length=1)
+    title: str = ""
+
+
 class Result(BaseModel):
     version: Literal[1] = 1
     session_id: str | None = None
     answer: str | None = None
+    sources: list[Source] | None = None
     error: str | None = None
     screenshot: str | None = None  # base64 PNG только для диагностической ошибки
     sessions: list[str] | None = None

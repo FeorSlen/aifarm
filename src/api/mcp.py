@@ -19,6 +19,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
 from pydantic import BaseModel, Field
 
+from src.contract import Source
+
 from .service import Gateway, GatewayError
 
 SEARCH_TIMEOUT_SECONDS = int(os.getenv("AIFARM_SEARCH_TIMEOUT_S", "180"))  # запас под медленный прокси
@@ -65,6 +67,7 @@ DEFAULT_USER = Gateway.require_user(_configured_user) if _configured_user else G
 class SearchResult(BaseModel):
     tab_id: str
     answer: str
+    sources: list[Source] = []
 
 
 class TabList(BaseModel):
@@ -79,6 +82,21 @@ def _diagnostic_error(message: str, screenshot: str | None) -> CallToolResult:
         )
     return CallToolResult(content=content, isError=True)
 
+
+def _sources_block(sources: list[dict]) -> str | None:
+    """Список источников под номерами маркеров [n] из текста ответа.
+
+    Отдельным блоком текста: клиент без structured output иначе не увидит
+    источники вовсе, а маркеры в ответе останутся без расшифровки.
+    """
+    if not sources:
+        return None
+    lines = [
+        f"[{source['index']}] {source['title']} — {source['url']}"
+        if source.get("title") else f"[{source['index']}] {source['url']}"
+        for source in sources
+    ]
+    return "Источники:\n" + "\n".join(lines)
 
 
 def _gateway() -> Gateway:
@@ -159,7 +177,9 @@ async def search(
     вашем знании: текущие события, цены, версии, локальная информация.
     Пишите короткий вопрос на английском языке. Вызов блокирующий, обычно занимает
     1–3 минуты: дождитесь результата, не повторяйте запрос и не запускайте параллельный
-    search. Возвращает текст ответа и tab_id этой беседы.
+    search. Возвращает текст ответа, источники и tab_id этой беседы. Ссылки,
+    которые Google проставил в ответе, отмечены в тексте маркерами [1], [2]…;
+    их расшифровка — в списке источников.
 
     Длинное задание отправляйте в два хода: короткий первый вопрос, затем
     развёрнутый текст вторым вызовом с полученным tab_id.
@@ -207,16 +227,21 @@ async def search(
     )
     if status == "done":
         answer = result["answer"] or ""
+        sources = result.get("sources") or []
         new_tab = result["tab_id"]
+        content = [TextContent(type="text", text=answer)]
+        listing = _sources_block(sources)
+        if listing:
+            content.append(TextContent(type="text", text=listing))
+        content.append(
+            TextContent(
+                type="text",
+                text=f"tab_id: {new_tab} — передайте его в search, чтобы продолжить этот диалог",
+            )
+        )
         return CallToolResult(
-            content=[
-                TextContent(type="text", text=answer),
-                TextContent(
-                    type="text",
-                    text=f"tab_id: {new_tab} — передайте его в search, чтобы продолжить этот диалог",
-                ),
-            ],
-            structured_content={"tab_id": new_tab, "answer": answer},
+            content=content,
+            structured_content={"tab_id": new_tab, "answer": answer, "sources": sources},
         )
     if status == "blocked":
         closed = ", ".join(result["closed_tab_ids"]) or "—"

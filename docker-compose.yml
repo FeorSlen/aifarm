@@ -58,7 +58,7 @@ services:
       AIFARM_ACCEPT_CONSENT: ${AIFARM_ACCEPT_CONSENT:-true}
       AIFARM_PROFILE_COOLDOWN_H: ${AIFARM_PROFILE_COOLDOWN_H:-6}  # через сколько часов профиль после /sorry/ снова в ротации
       AIFARM_PROFILE_MAX_QUERIES: ${AIFARM_PROFILE_MAX_QUERIES:-12}  # вопросов на профиль до плановой смены; 0 = только по /sorry/
-      AIFARM_HUMANIZE: ${AIFARM_HUMANIZE:-true}
+      AIFARM_HUMANIZE: ${AIFARM_HUMANIZE:-1.5}   # потолок секунд на движение курсора; false — выключить
       AIFARM_GEOIP: ${AIFARM_GEOIP:-true}
       AIFARM_LOCALE: ${AIFARM_LOCALE:-fr-FR}         # один язык между запусками; регион/TZ всё ещё берутся из geoip
       AIFARM_BLOCK_WEBRTC: ${AIFARM_BLOCK_WEBRTC:-true}
