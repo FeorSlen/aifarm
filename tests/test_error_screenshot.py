@@ -10,6 +10,8 @@ from src.api.service import Gateway, Job
 from src.contract import Result, Task
 from src.worker.browser import (
     AI_ANSWER,
+    AI_MODE_ARMED,
+    AI_MODE_CHIP,
     AI_MODE_LINK,
     FOLLOWUP_INPUT,
     GOOGLE_URL,
@@ -48,8 +50,12 @@ class DiagnosticScreenshotTest(unittest.TestCase):
         answer = MagicMock()
         link_locator = MagicMock(first=link)
         answer_locator = MagicMock(last=answer)
+        chip = MagicMock()
+        chip.click.side_effect = TimeoutError("chip missing")
         page.locator.side_effect = lambda selector: {
             SEARCH_BOX: box,
+            AI_MODE_CHIP: MagicMock(first=chip),
+            AI_MODE_ARMED: MagicMock(),
             AI_MODE_LINK: link_locator,
             AI_ANSWER: answer_locator,
         }[selector]
@@ -68,6 +74,54 @@ class DiagnosticScreenshotTest(unittest.TestCase):
             ],
         )
         link.click.assert_not_called()
+        answer.wait_for.assert_called_once()
+
+    def _chip_page(self, url_after_enter):
+        """Главная, где плашка AI Mode срабатывает; Enter ведёт на url_after_enter."""
+        browser = Browser.__new__(Browser)
+        browser._accept_cookies = lambda _page: None
+        typed = []
+        browser._type_query = lambda _page, _box, text: typed.append(text)
+
+        page = MagicMock()
+        page.url = "https://www.google.com/"
+        box = MagicMock()
+        box.press.side_effect = lambda _key: setattr(page, "url", url_after_enter)
+        chip = MagicMock()
+        link = MagicMock()
+        answer = MagicMock()
+        page.locator.side_effect = lambda selector: {
+            SEARCH_BOX: box,
+            AI_MODE_CHIP: MagicMock(first=chip),
+            AI_MODE_ARMED: MagicMock(),
+            AI_MODE_LINK: MagicMock(first=link),
+            AI_ANSWER: MagicMock(last=answer),
+        }[selector]
+        return browser, page, chip, link, answer, typed
+
+    def test_ai_mode_chip_goes_straight_to_ai_mode(self):
+        browser, page, chip, link, answer, typed = self._chip_page(
+            "https://www.google.com/search?q=snow&source=hp&udm=50"
+        )
+
+        browser._open_ai_mode(page, "why is snow white")
+
+        chip.click.assert_called_once()
+        self.assertEqual(page.goto.call_count, 1)  # только главная, без выдачи
+        link.wait_for.assert_not_called()
+        self.assertEqual(typed, ["why is snow white"])
+        answer.wait_for.assert_called_once()
+
+    def test_chip_that_landed_on_plain_results_continues_via_tab_without_retyping(self):
+        browser, page, chip, link, answer, typed = self._chip_page(
+            "https://www.google.com/search?q=snow&source=hp"
+        )
+
+        browser._open_ai_mode(page, "why is snow white")
+
+        link.click.assert_called_once()
+        self.assertEqual(typed, ["why is snow white"])  # вопрос отправлен один раз
+        self.assertEqual(page.goto.call_count, 1)
         answer.wait_for.assert_called_once()
 
     def test_current_followup_input_matches_live_ai_mode_markup(self):

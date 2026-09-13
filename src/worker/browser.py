@@ -54,6 +54,13 @@ GOOGLE_URL = _google_url(BROWSER_LOCALE)
 SEARCH_BOX = "textarea[name='q']"
 ACCEPT_COOKIES_BTN = "#L2AGLb"  # id кнопки "Accept all" у Google, не зависит от локали
 AI_MODE_LINK = 'a[href*="udm=50"]'  # вкладка "Режим ИИ" на странице выдачи; udm=50 от локали не зависит
+# Быстрый вход: плашка «Режим ИИ» прямо в строке поиска главной. Ищем по иконке
+# (искра + лупа): текст плашки на языке интерфейса, а классы Google гниют.
+AI_MODE_CHIP = 'button:has(path[d^="M17.5 12c0-3.04"])'
+# Признак, что клик по плашке переключил форму: Google дописывает в неё скрытое
+# udm=50, и Enter уходит сразу в AI Mode, минуя обычную выдачу. Placeholder
+# тоже меняется («Ask Google»), но он локализован.
+AI_MODE_ARMED = 'form input[type="hidden"][name="udm"][value="50"]'
 # Поле уточняющего вопроса в AI Mode. На странице AI Mode ДВЕ textarea: скрытая
 # форма отзыва (class e3RQ5d, placeholder 'Jaa tietoja…' / 'Поделиться…') идёт в
 # DOM первой, настоящее поле диалога (class ITIRGe) — второй. Фильтр по
@@ -123,6 +130,10 @@ CONSENT_PROBE_TIMEOUT = int(os.getenv("CONSENT_PROBE_TIMEOUT_MS", "8000"))
 # не ожидание элемента, а необязательный жест, у которого есть замена (см.
 # _focus_field). Выстаивать за него 20 с и валить сессию нельзя.
 FIELD_CLICK_TIMEOUT = int(os.getenv("FIELD_CLICK_TIMEOUT_MS", "6000"))
+# Сколько ждать, что форма переключилась в AI Mode после клика по плашке.
+# Переключение — перерисовка на месте, без навигации; не дождались — идём
+# обычным путём, поэтому потолок короткий.
+AI_MODE_ARM_TIMEOUT = int(os.getenv("AI_MODE_ARM_TIMEOUT_MS", "5000"))
 
 # Сколько последних символов запроса допечатываются посимвольно. Остальное
 # вставляется одним fill(): посимвольный ввод всей простыни — это по XHR в
@@ -344,6 +355,11 @@ def _valid_sources(raw) -> list[dict]:
 def _followup_key_layout(text: str) -> str:
     """Набирает кириллицу теми же клавишами в английской раскладке."""
     return text.translate(_RU_TO_EN_KEYS)
+
+
+def _in_ai_mode(url: str) -> bool:
+    """Страница уже в AI Mode (udm=50): переходить во вкладку не нужно."""
+    return ("udm", "50") in parse_qsl(urlsplit(url).query)
 
 
 def _ai_mode_url(search_url: str) -> str:
@@ -908,8 +924,25 @@ class Browser:
             self.shutdown()
             return self._take_free_page(self._ensure_browser())
 
+    def _arm_ai_mode(self, page) -> bool:
+        """Клик по плашке «Режим ИИ» на главной. True — форма переключилась."""
+        try:
+            page.locator(AI_MODE_CHIP).first.click(timeout=FIELD_CLICK_TIMEOUT)
+            page.locator(AI_MODE_ARMED).wait_for(state="attached", timeout=AI_MODE_ARM_TIMEOUT)
+        except Exception:
+            print("плашка AI Mode не сработала, иду через обычную выдачу", flush=True)
+            return False
+        page.wait_for_timeout(random.uniform(250, 700))  # глазом к полю
+        return True
+
     def _open_ai_mode(self, page, prompt: str, human_tail: str = None):
-        """google.com → ввод запроса → клик по вкладке "Режим ИИ" → ждём ответ.
+        """google.com → плашка «Режим ИИ» → ввод запроса → Enter → ждём ответ.
+
+        Предпочтительный путь — плашка на главной: вопрос уходит сразу в AI Mode,
+        без обычной выдачи и лишней навигации. Если плашка не сработала, вопрос
+        уходит в обычный поиск, а в AI Mode переходим вкладкой на выдаче. Та же
+        вкладка страхует и случай, когда плашка сработала, а Enter всё равно
+        привёл на обычную выдачу: вопрос уже отправлен, повторно его не набираем.
 
         human_tail: если задан — prompt вставляется целиком (fill), а human_tail
         допечатывается по-человечески в конце (для длинного контекста + короткого
@@ -918,6 +951,7 @@ class Browser:
         """
         page.goto(GOOGLE_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
         self._accept_cookies(page)
+        self._arm_ai_mode(page)
 
         box = page.locator(SEARCH_BOX)
         if human_tail is None:
@@ -933,18 +967,19 @@ class Browser:
         page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
         _check_blocked(page)
 
-        # Обычно переходим кликом по вкладке. Google иногда убирает её из шапки
-        # обычной выдачи; тогда открываем ту же выдачу с udm=50 напрямую.
-        link = page.locator(AI_MODE_LINK).first
-        try:
-            link.wait_for(state="visible", timeout=EL_TIMEOUT)
-        except Exception:
-            page.goto(_ai_mode_url(page.url), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-        else:
-            page.wait_for_timeout(random.uniform(300, 900))
-            link.click()
-        page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
-        _check_blocked(page)
+        if not _in_ai_mode(page.url):
+            # Обычная выдача: переходим кликом по вкладке. Google иногда убирает
+            # её из шапки; тогда открываем ту же выдачу с udm=50 напрямую.
+            link = page.locator(AI_MODE_LINK).first
+            try:
+                link.wait_for(state="visible", timeout=EL_TIMEOUT)
+            except Exception:
+                page.goto(_ai_mode_url(page.url), wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+            else:
+                page.wait_for_timeout(random.uniform(300, 900))
+                link.click()
+            page.wait_for_load_state("domcontentloaded", timeout=NAV_TIMEOUT)
+            _check_blocked(page)
         try:
             page.locator(AI_ANSWER).last.wait_for(state="visible", timeout=EL_TIMEOUT)
         except Exception as error:
