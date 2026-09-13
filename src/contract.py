@@ -1,13 +1,36 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+
+class Attachment(BaseModel):
+    """Вложение сообщения: файл в общем каталоге загрузок (см. src/api/uploads.py)."""
+
+    path: str = Field(min_length=1)  # абсолютный путь, одинаковый у шлюза и воркера
+    name: str = Field(min_length=1)  # имя, под которым Google покажет файл
+    kind: Literal["image", "file"]   # в какой input AI Mode его отдавать
 
 
 class Task(BaseModel):
     version: Literal[1] = 1
     user_session_id: str = Field(min_length=1)
     session_id: str | None = None
-    query: str | None = Field(default=None, min_length=1, max_length=10_000)
+    # None — управляющая задача (список или закрытие вкладок). Сообщение — это
+    # текст, вложения или и то и другое: при вложениях текст может быть пустым.
+    query: str | None = Field(default=None, max_length=10_000)
+    attachments: list[Attachment] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_message(self):
+        if self.query is None:
+            if self.attachments:
+                raise ValueError("attachments need a message, not a control task")
+            return self
+        if not self.query.strip() and not self.attachments:
+            raise ValueError("message needs text or attachments")
+        if self.attachments and self.session_id is None:
+            raise ValueError("attachments are sent only into an active session")
+        return self
 
 
 class Source(BaseModel):

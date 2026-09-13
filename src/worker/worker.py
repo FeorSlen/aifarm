@@ -25,7 +25,9 @@ def handle(browser: Browser, task: Task) -> Result:
         if session_id is None:
             session_id = browser.new_search_session(task.user_session_id, task.query)
         else:
-            browser.ask_followup(task.user_session_id, session_id, task.query)
+            browser.ask_followup(
+                task.user_session_id, session_id, task.query, task.attachments
+            )
         # Порядок важен: источники собираются во время разбора ответа, поэтому
         # last_sources() имеет смысл только после get_last_ai_answer().
         answer = browser.get_last_ai_answer(task.user_session_id, session_id)

@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from src.contract import Source
 
+from . import uploads
 from .service import Gateway, GatewayError
 
 SEARCH_TIMEOUT_SECONDS = int(os.getenv("AIFARM_SEARCH_TIMEOUT_S", "180"))  # запас под медленный прокси
@@ -49,7 +50,9 @@ INSTRUCTIONS = (
     "Если задание длиннее, начните "
     f"беседу коротким вопросом по сути, а развёрнутый текст (до {FOLLOWUP_QUERY_MAX_CHARS} "
     "символов) пришлите вторым вызовом search с полученным tab_id — он уходит уже "
-    "в поле AI Mode."
+    "в поле AI Mode. "
+    "Картинки и файлы — только в активную беседу: загрузите их через POST /files "
+    "шлюза (ответ — file_id) и передайте file_ids вместе с tab_id."
 )
 
 mcp = MCPServer("aifarm", instructions=INSTRUCTIONS)
@@ -122,16 +125,35 @@ def _check_question_length(question: str, tab_id: str | None) -> None:
     )
 
 
+def resolve_user(raw: str | None) -> str:
+    """Арендатор по заголовку X-Aifarm-User; без заголовка — общий DEFAULT_USER.
+
+    Общая точка для MCP и HTTP-загрузки: file_id одного арендатора в беседу
+    другого не попадёт. Кривой заголовок — GatewayError.
+    """
+    if not raw:
+        return DEFAULT_USER
+    return Gateway.require_user(raw)
+
+
+def _check_message(question: str, tab_id: str | None, file_ids: list[str]) -> None:
+    """Сообщение — текст, вложения или и то и другое; вложения только в беседу."""
+    if file_ids and not tab_id:
+        raise ToolError(
+            "Вложения отправляются только в активную беседу. Начните беседу вопросом "
+            "без вложений, затем повторите search с полученным tab_id и file_ids."
+        )
+    if not question.strip() and not file_ids:
+        raise ToolError("Вопрос не может быть пустым")
+
+
 def _user(ctx: Context) -> str:
     try:
         headers = ctx.headers or {}
     except Exception:
         headers = {}
-    raw = headers.get("x-aifarm-user")
-    if not raw:
-        return DEFAULT_USER
     try:
-        return Gateway.require_user(raw)
+        return resolve_user(headers.get("x-aifarm-user"))
     except GatewayError:
         raise ToolError("Заголовок X-Aifarm-User должен быть корректным uuid4") from None
 
@@ -149,16 +171,15 @@ async def search(
     question: Annotated[
         str,
         Field(
-            min_length=1,
             max_length=FOLLOWUP_QUERY_MAX_CHARS,
             description=(
                 "Короткий естественный вопрос на английском языке; один вызов — один "
-                "вопрос. Не может быть пустым. Без tab_id "
+                "вопрос. Пустым может быть только вместе с file_ids. Без tab_id "
                 f"(первый вопрос беседы) — максимум {FIRST_QUERY_MAX_CHARS} символов, "
                 f"с tab_id — до {FOLLOWUP_QUERY_MAX_CHARS}."
             ),
         ),
-    ],
+    ] = "",
     tab_id: Annotated[
         str | None,
         Field(
@@ -167,6 +188,17 @@ async def search(
                 "вызова search или из my_searches. Передайте, чтобы продолжить тот "
                 "же диалог AI Mode (Google увидит весь контекст беседы). Опустите, "
                 "чтобы начать новую независимую беседу. Вкладки живут 24 часа."
+            ),
+        ),
+    ] = None,
+    file_ids: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Вложения сообщения: file_id картинок и файлов, заранее загруженных в "
+                "шлюз (POST /files, multipart-поле file, тот же заголовок X-Aifarm-User). "
+                "Только вместе с tab_id: в новую беседу вложения не отправляются. "
+                f"Не больше {uploads.MAX_ATTACHMENTS}. С вложениями question может быть пустым."
             ),
         ),
     ] = None,
@@ -183,15 +215,22 @@ async def search(
 
     Длинное задание отправляйте в два хода: короткий первый вопрос, затем
     развёрнутый текст вторым вызовом с полученным tab_id.
+
+    Картинки и файлы — только в активную беседу: загрузите их через POST /files
+    (ответ — file_id) и передайте file_ids вместе с tab_id.
     """
-    if not question.strip():
-        raise ToolError("Вопрос не может быть пустым")
+    file_ids = file_ids or []
+    _check_message(question, tab_id, file_ids)
     _check_question_length(question, tab_id)
     gateway = _gateway()
     user = _user(ctx)
+    try:
+        attachments = uploads.resolve(user, file_ids)
+    except uploads.UploadError as error:
+        raise ToolError(str(error)) from None
     start = time.monotonic()
     try:
-        job_id = await gateway.search(user, question, tab_id)
+        job_id = await gateway.search(user, question, tab_id, attachments)
     except GatewayError as error:
         raise ToolError(error.message) from None
 
@@ -219,10 +258,11 @@ async def search(
 
     status = result["status"]
     log.info(
-        "SEARCH %.1fs status=%s tab=%s q=%r",
+        "SEARCH %.1fs status=%s tab=%s files=%d q=%r",
         time.monotonic() - start,
         status,
         tab_id or "new",
+        len(file_ids),
         question[:60],
     )
     if status == "done":
@@ -275,6 +315,12 @@ async def search(
         )
         return _diagnostic_error(
             message + diagnostic, screenshot,
+        )
+    if code == "attachment_failed":
+        return _diagnostic_error(
+            "Вложения не удалось прикрепить к беседе: Google их не принял или они не "
+            "загрузились. Вкладка и профиль целы, search можно повторить.",
+            result.get("screenshot"),
         )
     if code == "tab_not_found":
         raise ToolError(

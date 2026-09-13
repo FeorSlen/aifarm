@@ -74,6 +74,20 @@ AI_ANSWER = '[data-container-id="main-col"]'  # один такой блок н�
 # ставит его же скрипт (`d.setAttribute("data-aeie","true")`), поэтому маркер не
 # зависит от языка — сам текст внутри локализован (видели французский на проде).
 ANSWER_ERROR = '[data-aeie="true"]'
+# Вложения у поля уточнения AI Mode (снято с живой страницы 2026-09-13). «+» —
+# по иконке плюса; после клика в DOM два input[type=file]: картинки (accept из
+# одних image/*) и файлы (accept пустой, на главной — */*). Пункты меню не
+# трогаем — они на языке интерфейса; файл кладётся прямо в нужный input.
+ATTACH_BUTTON = 'button:has(path[d^="M440-440H200v-80H440V-760"])'
+# Вложение принято, когда есть его карточка (title = имя файла) и индикатор
+# загрузки внутри неё скрыт. Вживую на мелких файлах это 0.2–0.9 с.
+ATTACHED_JS = """(names) => names.every((name) => {
+    const chip = Array.from(document.querySelectorAll('[role="button"][title]'))
+        .find((node) => node.getAttribute('title') === name && node.offsetParent !== null);
+    if (!chip) return false;
+    const bar = chip.querySelector('[role="progressbar"]');
+    return !bar || bar.offsetParent === null;
+})"""
 
 # Физические клавиши русской раскладки в английской: уточнение «Почему»
 # отправляется как «Gjxtve». Остальные символы оставляем как есть.
@@ -134,6 +148,9 @@ FIELD_CLICK_TIMEOUT = int(os.getenv("FIELD_CLICK_TIMEOUT_MS", "6000"))
 # Переключение — перерисовка на месте, без навигации; не дождались — идём
 # обычным путём, поэтому потолок короткий.
 AI_MODE_ARM_TIMEOUT = int(os.getenv("AI_MODE_ARM_TIMEOUT_MS", "5000"))
+# Потолок на то, чтобы Google принял вложения: мелкие файлы — меньше секунды,
+# запас под крупные файлы и медленный прокси.
+ATTACH_TIMEOUT = int(os.getenv("ATTACH_TIMEOUT_S", "60")) * 1000
 
 # Сколько последних символов запроса допечатываются посимвольно. Остальное
 # вставляется одним fill(): посимвольный ввод всей простыни — это по XHR в
@@ -369,6 +386,12 @@ def _in_ai_mode(url: str) -> bool:
     return ("udm", "50") in parse_qsl(urlsplit(url).query)
 
 
+def _is_image_accept(accept: str) -> bool:
+    """input картинок AI Mode: accept состоит только из image/* типов."""
+    parts = [part.strip() for part in (accept or "").split(",") if part.strip()]
+    return bool(parts) and all(part.startswith("image/") for part in parts)
+
+
 def _ai_mode_url(search_url: str) -> str:
     """Добавляет AI Mode к текущей выдаче, сохраняя запрос и параметры Google."""
     parts = urlsplit(search_url)
@@ -423,6 +446,12 @@ class AnswerRefusedError(AnswerUnavailableError):
     """
 
     code = "answer_refused"
+
+
+class AttachmentError(AnswerUnavailableError):
+    """Вложение не прикрепилось к полю AI Mode. Вкладка и профиль целы."""
+
+    code = "attachment_failed"
 
 
 class ProfilePoolExhaustedError(Exception):
@@ -1054,8 +1083,51 @@ class Browser:
         self._sessions[session_id] = session
         return self._public_session_id(session_id)
 
-    def ask_followup(self, user_session_id: str, session_id: str, query: str) -> None:
-        """Задаёт новый вопрос в том же диалоге AI Mode, той же вкладкой."""
+    def _attach(self, page, attachments) -> None:
+        """Прикрепляет вложения к полю уточнения и ждёт, пока Google их примет."""
+        missing = [item.name for item in attachments if not os.path.isfile(item.path)]
+        if missing:
+            raise AttachmentError(f"файл вложения не найден на воркере: {', '.join(missing)}")
+        by_kind: dict[str, list] = {}
+        for item in attachments:
+            by_kind.setdefault(item.kind, []).append(item)
+        try:
+            for kind, items in by_kind.items():
+                self._click_unstable(page.locator(ATTACH_BUTTON).last)
+                page.wait_for_timeout(random.uniform(300, 700))
+                inputs = page.locator("input[type=file]")
+                accepts = inputs.evaluate_all("(nodes) => nodes.map((node) => node.accept || '')")
+                wanted = [index for index, accept in enumerate(accepts)
+                          if _is_image_accept(accept) == (kind == "image")]
+                if not wanted:
+                    page.keyboard.press("Escape")
+                    raise AttachmentError(
+                        f"у поля AI Mode нет input для {'картинок' if kind == 'image' else 'файлов'}",
+                        self._capture_screenshot(page),
+                    )
+                inputs.nth(wanted[-1]).set_input_files([item.path for item in items])
+                page.keyboard.press("Escape")  # меню закрыть: файлы уже в input
+            page.wait_for_function(
+                ATTACHED_JS, arg=[item.name for item in attachments], timeout=ATTACH_TIMEOUT
+            )
+        except AttachmentError:
+            self._dump_page(page, "attach_fail")
+            raise
+        except Exception as error:
+            self._dump_page(page, "attach_fail")
+            reason = str(error).splitlines()[0][:120] if str(error) else type(error).__name__
+            raise AttachmentError(
+                f"вложения не прикрепились: {reason}", self._capture_screenshot(page)
+            ) from error
+
+    def ask_followup(self, user_session_id: str, session_id: str, query: str,
+                     attachments=()) -> None:
+        """Задаёт новый вопрос в том же диалоге AI Mode, той же вкладкой.
+
+        attachments — картинки и файлы этого сообщения; прикрепляются до ввода
+        текста. При вложениях текст может быть пустым: пустой Enter сообщение
+        отправляет (проверено вживую).
+        """
         session = self._session(user_session_id, session_id)
         self._profile_budget -= 1
         page = session.page
@@ -1079,6 +1151,8 @@ class Browser:
                 "поле уточняющего вопроса AI Mode не найдено",
                 self._capture_screenshot(page),
             ) from error
+        if attachments:
+            self._attach(page, attachments)
         sent_query = _followup_key_layout(query)
         self._type_query(page, box, sent_query)
         page.wait_for_timeout(random.uniform(600, 1800))  # перечитать набранное перед отправкой

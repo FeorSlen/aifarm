@@ -2,10 +2,11 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 
 from . import mcp as mcp_module
-from .service import Gateway
+from . import uploads
+from .service import Gateway, GatewayError
 
 # uvicorn настраивает только свои логгеры; поднимаем app-логгеры до INFO,
 # чтобы было видно строки SEARCH (время ответа на запрос) в docker compose logs.
@@ -53,3 +54,25 @@ app.router.routes.extend(
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/files")
+async def upload_file(
+    file: UploadFile = File(...),
+    x_aifarm_user: str | None = Header(default=None),
+):
+    """Загрузка вложения для search(file_ids=...): возвращает file_id.
+
+    Арендатор тот же, что у MCP (X-Aifarm-User или общий по умолчанию), поэтому
+    file_id одного арендатора в беседу другого не попадёт.
+    """
+    try:
+        user = mcp_module.resolve_user(x_aifarm_user)
+    except GatewayError:
+        raise HTTPException(400, "Заголовок X-Aifarm-User должен быть корректным uuid4") from None
+    try:
+        return await uploads.save(user, file.filename or "", file)
+    except uploads.UploadTooLarge as error:
+        raise HTTPException(413, str(error)) from None
+    except uploads.UploadError as error:
+        raise HTTPException(400, str(error)) from None

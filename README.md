@@ -21,6 +21,20 @@ claude mcp add --transport http aifarm http://localhost:8000/mcp
 (список вкладок), `close` (закрыть вкладку). `tab_id` из ответа `search`
 передаётся обратно, чтобы продолжить тот же диалог.
 
+**Вложения.** Картинки и файлы отправляются только в активную беседу. Файл
+сначала загружается в шлюз, в ответ приходит `file_id`:
+
+```bash
+curl -s -F file=@photo.png -H 'X-Aifarm-User: <uuid4>' localhost:8000/files
+# {"file_id":"…","name":"photo.png","size":42262,"kind":"image"}
+```
+
+Затем `search(question, tab_id, file_ids=[…])`. Сообщение — любая комбинация
+текста, картинок и файлов; при вложениях `question` может быть пустым. Картинки
+(avif/bmp/jpeg/png/webp/heif/heic) уходят в поле картинок AI Mode, остальное —
+в поле файлов. `file_id` привязан к арендатору (`X-Aifarm-User`) и живёт
+`AIFARM_UPLOAD_TTL_S`.
+
 `search` возвращает `{tab_id, answer, sources}`: ссылки, проставленные Google в
 ответе, помечены в тексте маркерами `[1]`, `[2]`… и расшифрованы в `sources`
 (`index`, `url`, `title`). Источники читаются из уже отрендеренной разметки
@@ -63,7 +77,8 @@ GOOGLE_COOKIES_FILE=/app/cookies.txt     # . смонтирован в /app
 | `AIFARM_PROFILE_PATH` | — | прямой путь к одному профилю; имеет приоритет над пулом |
 | `GOOGLE_COOKIES_FILE` | — | путь к файлу куков (Netscape/JSON) |
 | `AIFARM_SEED_COOKIES` | `false` | инъекция куков до навигации; для постоянного авторизованного профиля выключена |
-| `AIFARM_READ_SCROLL` | `true` | прокрутка ответа в темпе чтения, пока он пишется |
+| `AIFARM_READ_SCROLL` | `true` | беглое чтение готового ответа прокруткой: 2–3 остановки, не дольше `AIFARM_FOLLOWUP_READ_MAX_S` |
+| `AIFARM_FOLLOWUP_READ_MAX_S` | `4` | потолок фазы чтения одного ответа (вместе с наведением курсора) |
 | `AIFARM_ACCEPT_CONSENT` | `true` | авто-принятие диалога согласия Google (все фреймы/локали) |
 | `AIFARM_PROFILE_COOLDOWN_H` | `6` | сколько часов профиль после `/sorry/` не берётся в ротацию |
 | `AIFARM_PROFILE_MAX_QUERIES` | `12` | вопросов на профиль до плановой смены (с разбросом ±2); `0` — менять только по `/sorry/` |
@@ -81,6 +96,11 @@ GOOGLE_COOKIES_FILE=/app/cookies.txt     # . смонтирован в /app
 | `AIFARM_SEARCH_TIMEOUT_S` | `180` | общий потолок инструмента `search` в шлюзе |
 | `AIFARM_FIRST_QUERY_MAX` | `200` | предел длины первого вопроса беседы (строка поиска Google) |
 | `AIFARM_FOLLOWUP_QUERY_MAX` | `4000` | предел длины вопроса с `tab_id` (поле AI Mode) |
+| `AIFARM_UPLOAD_DIR` | `./uploads` | общий каталог вложений шлюза и воркера (в compose — том `uploads`) |
+| `AIFARM_UPLOAD_MAX_MB` | `20` | предел размера одного загружаемого файла |
+| `AIFARM_UPLOAD_TTL_S` | `3600` | сколько живёт загруженный файл до отправки |
+| `AIFARM_MAX_ATTACHMENTS` | `10` | вложений в одном сообщении |
+| `ATTACH_TIMEOUT_S` | `60` | ожидание, пока Google примет вложения |
 | `VNC_BIND` | `127.0.0.1:5900` | VNC-доступ к `Xvfb :99`; по умолчанию только через SSH-туннель |
 | `GATEWAY_BIND` | `127.0.0.1:8000` | привязка публикуемого порта |
 | `AIFARM_MCP_HOST` | `127.0.0.1` | host для `/mcp`; не-loopback выключает DNS-rebinding guard |

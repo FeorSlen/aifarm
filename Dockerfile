@@ -19,8 +19,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt "camoufox[geoip]"
 
 RUN useradd --create-home --uid 10001 app \
-    && mkdir -p /data/profiles \
-    && chown app:app /data/profiles
+    && mkdir -p /data/profiles /data/uploads \
+    && chown app:app /data/profiles /data/uploads
 ENV HOME=/home/app
 USER app
 RUN python -m camoufox fetch

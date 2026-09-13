@@ -95,15 +95,19 @@ class Gateway:
         return result.sessions or []
 
     async def search(
-        self, user_session_id: str, question: str, tab_id: str | None
+        self, user_session_id: str, question: str, tab_id: str | None, attachments=()
     ) -> str:
+        # Задача собирается до публикации: ошибка в самом сообщении — не сбой брокера.
+        task = Task(
+            user_session_id=user_session_id,
+            session_id=tab_id,
+            query=question,
+            attachments=list(attachments),
+        )
         job_id = str(uuid.uuid4())
         self.jobs[job_id] = Job(user_session_id=user_session_id, tab_id=tab_id)
         try:
-            await self._publish(
-                Task(user_session_id=user_session_id, session_id=tab_id, query=question),
-                job_id,
-            )
+            await self._publish(task, job_id)
         except Exception as error:
             log.exception("could not publish job %s", job_id)
             self.jobs.pop(job_id, None)  # job_id наружу не ушёл — забываем целиком
@@ -193,6 +197,9 @@ class Gateway:
                     "code": result.error,
                     "message": "Google не сгенерировал ответ",
                 }
+            elif result.error == "attachment_failed":
+                job.status = "failed"
+                job.error = {"code": result.error, "message": "Вложение не удалось прикрепить"}
             elif result.error == "session_not_found":
                 job.status = "failed"
                 job.error = {"code": "tab_not_found", "message": "Вкладка не найдена"}

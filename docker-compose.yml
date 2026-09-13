@@ -27,11 +27,17 @@ services:
       AIFARM_SEARCH_TIMEOUT_S: ${AIFARM_SEARCH_TIMEOUT_S:-600}
       AIFARM_FIRST_QUERY_MAX: ${AIFARM_FIRST_QUERY_MAX:-200}       # первый вопрос идёт в строку google.com
       AIFARM_FOLLOWUP_QUERY_MAX: ${AIFARM_FOLLOWUP_QUERY_MAX:-4000}  # продолжение — в поле AI Mode
+      # Вложения: шлюз пишет файл (POST /files), воркер читает его по тому же пути.
+      AIFARM_UPLOAD_DIR: /data/uploads
+      AIFARM_UPLOAD_MAX_MB: ${AIFARM_UPLOAD_MAX_MB:-20}
+      AIFARM_UPLOAD_TTL_S: ${AIFARM_UPLOAD_TTL_S:-3600}
+      AIFARM_MAX_ATTACHMENTS: ${AIFARM_MAX_ATTACHMENTS:-10}
     ports:
       # публичный доступ на VPS: GATEWAY_BIND=0.0.0.0:8000 (+ AIFARM_MCP_HOST=0.0.0.0)
       - "${GATEWAY_BIND:-127.0.0.1:8000}:8000"
     volumes:
       - .:/app
+      - uploads:/data/uploads
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -72,6 +78,7 @@ services:
     volumes:
       - .:/app
       - browser-profiles:/data/profiles
+      - uploads:/data/uploads
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -79,3 +86,4 @@ services:
 volumes:
   rabbitmq-data:
   browser-profiles:
+  uploads:
